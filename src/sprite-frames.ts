@@ -91,24 +91,22 @@ export function generateFramePrompts(
     return Array.from({ length: frameCount }, (_, i) => {
       const poseIndex = i % preset.length;
       if (i === 0) {
-        // Frame 1: generated from scratch, full description
         return `${baseDescription}, ${animation} animation, ${preset[poseIndex]}`;
       }
-      // Frames 2+: edited from frame 1, emphasize pose change
-      return `Change the pose of this character to: ${preset[poseIndex]}. ` +
-        `Keep the same character, same outfit, same art style. ` +
+      // Frames 2+: reinforce character identity + demand pose change
+      return `${baseDescription}. Change the pose to: ${preset[poseIndex]}. ` +
+        `Keep the same character, same outfit, same colors, same art style. ` +
         `ONLY change the body pose, leg positions, and arm positions. ` +
         `The legs and arms MUST be in a clearly different position than the original.`;
     });
   }
 
-  // No preset and no custom descriptions: generate generic frame variation
   return Array.from({ length: frameCount }, (_, i) => {
     if (i === 0) {
       return `${baseDescription}, ${animation} animation, neutral starting pose`;
     }
-    return `Change the pose of this character to: phase ${i + 1} of ${frameCount} ` +
-      `in a ${animation} motion. Keep the same character, same outfit, same art style. ` +
+    return `${baseDescription}. Change the pose to: phase ${i + 1} of ${frameCount} ` +
+      `in a ${animation} motion. Keep the same character, same outfit, same colors, same art style. ` +
       `ONLY change the body pose. The legs and arms MUST be in a clearly different position.`;
   });
 }
@@ -168,10 +166,12 @@ export async function generateFrames(
       totalSteps
     );
 
+    // Use the same size as frame 1 so all frames match
+    const editSize = `${result.width}x${result.height}` as "1024x1024" | "1536x1024" | "1024x1536";
     let editedBuffer = await generator.editImage(
       baseFrameBuffer,
       prompts[i],
-      { quality: params.quality, size: "1024x1024" }
+      { quality: params.quality, size: editSize }
     );
 
     // Strip background to true alpha (edit API doesn't support transparent param)

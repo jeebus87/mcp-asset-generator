@@ -133,7 +133,7 @@ export function saveSpriteSheetMeta(
  */
 export async function removeBackground(
   buffer: Buffer,
-  lightThreshold: number = 220,
+  lightThreshold: number = 235,
   alphaCutoff: number = 128
 ): Promise<Buffer> {
   const image = sharp(buffer);
