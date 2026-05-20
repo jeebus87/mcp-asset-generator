@@ -4,7 +4,7 @@ An MCP server that turns rough text descriptions into production-ready visual as
 
 Works with any MCP-compatible client (Claude Desktop, Claude Code, Cursor, etc.) and uses OpenAI's image generation API under the hood.
 
-**18 tools.** Logos, icons, banners, favicons, OG images, illustrations, email headers, print newsletters, game sprites, game characters, game backgrounds, game UI, sprite sheet animations with JSON metadata (single-image or per-frame high-quality), a smart router that picks the right tool from your description, and codebase wiring that finds where to plug the asset in and does it for you.
+**19 tools.** Logos, icons, banners, favicons, OG images, illustrations, email headers, print newsletters, game sprites, game characters, game backgrounds, game UI, sprite sheet animations with JSON metadata (single-image or per-frame high-quality), a smart router that picks the right tool from your description, and codebase wiring that finds where to plug the asset in and does it for you.
 
 ## What it generates
 
@@ -272,6 +272,23 @@ Examples of what the router understands:
 - *"social media share image for my blog"* routes to `generate_og_image`
 - *"a health potion game icon"* routes to `generate_game_icon`
 - *"walk cycle sprite sheet for a knight"* routes to `generate_sprite_sheet`
+
+### GIF creation
+
+| Tool | Description |
+|------|-------------|
+| `create_gif` | Create an animated GIF from a folder of images (PNG, JPG, WebP). Sorts files alphabetically. Supports loop control -- play once (default) or infinite loop. |
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `folder` | *(required)* | Path to folder containing images |
+| `output` | `{folder}/animation.gif` | Output GIF path |
+| `fps` | `2` | Frames per second |
+| `width` | `800` | Output width (height preserves aspect ratio) |
+| `loop` | `false` | Loop the animation. False = play once and stop. |
+| `background` | `#ffffff` | Background color as hex. Use `transparent` for no background. |
+
+The `generate_sprite_sheet_hq` tool also outputs a `.gif` preview automatically (looping, dark background, 256x256).
 
 ### Codebase wiring
 

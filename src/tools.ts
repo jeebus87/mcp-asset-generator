@@ -701,6 +701,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         .boolean()
         .optional()
         .describe("Also generate an animated GIF preview alongside the sprite sheet. Defaults to true."),
+      gif_background: z
+        .string()
+        .optional()
+        .describe("Background color for the GIF preview as hex (e.g., '#2a2a2a'). Defaults to dark gray. Use 'transparent' for no background."),
     },
     GENERATION_ANNOTATIONS,
     async (args, extra) => {
@@ -771,7 +775,22 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         let gifPath: string | null = null;
         if (wantGif) {
           await sendProgress("Creating animated GIF preview", frameCount + 3, totalSteps);
-          const gifBuffer = await createAnimatedGif(frameBuffers, frameWidth, frameHeight, fps);
+
+          let gifBg: { r: number; g: number; b: number } | null | undefined;
+          if (args.gif_background === "transparent") {
+            gifBg = null;
+          } else if (args.gif_background) {
+            const hex = args.gif_background.replace("#", "");
+            gifBg = {
+              r: parseInt(hex.slice(0, 2), 16),
+              g: parseInt(hex.slice(2, 4), 16),
+              b: parseInt(hex.slice(4, 6), 16),
+            };
+          }
+
+          const gifBuffer = await createAnimatedGif(frameBuffers, frameWidth, frameHeight, fps, {
+            background: gifBg,
+          });
           gifPath = filePath.replace(/\.png$/, ".gif");
           fs.writeFileSync(gifPath, gifBuffer);
         }
@@ -813,6 +832,137 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           isError: true,
         };
       }
+    }
+  );
+
+  // GIF creation from folder of images (timelapse, screenshots, etc.)
+  server.tool(
+    "create_gif",
+    "Create an animated GIF from a folder of images (PNG, JPG, WebP). " +
+      "Images are sorted alphabetically and played in sequence. " +
+      "Useful for timelapses, screenshot sequences, progress recordings, or any image series.",
+    {
+      folder: z
+        .string()
+        .describe("Path to folder containing images. Files are sorted alphabetically."),
+      output: z
+        .string()
+        .optional()
+        .describe("Output GIF path. Defaults to {folder}/animation.gif"),
+      fps: z
+        .number()
+        .min(1)
+        .max(30)
+        .optional()
+        .describe("Frames per second. Defaults to 2 (good for timelapse/screenshots)."),
+      width: z
+        .number()
+        .int()
+        .min(64)
+        .max(1920)
+        .optional()
+        .describe("Output width in pixels. Defaults to 800. Height scales to preserve aspect ratio."),
+      loop: z
+        .boolean()
+        .optional()
+        .describe("Loop the animation. Defaults to false (play once and stop)."),
+      background: z
+        .string()
+        .optional()
+        .describe("Background color as hex (e.g., '#ffffff'). Defaults to white."),
+    },
+    { readOnlyHint: false, destructiveHint: false },
+    async (args, extra) => {
+      const folder = path.resolve(args.folder);
+
+      if (!fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) {
+        return {
+          content: [{ type: "text" as const, text: `Folder not found: ${args.folder}` }],
+          isError: true,
+        };
+      }
+
+      // Collect image files, sorted alphabetically
+      const imageExts = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+      const files = fs.readdirSync(folder)
+        .filter((f: string) => imageExts.has(path.extname(f).toLowerCase()))
+        .sort();
+
+      if (files.length < 2) {
+        return {
+          content: [{ type: "text" as const, text: `Need at least 2 images. Found ${files.length} in ${args.folder}` }],
+          isError: true,
+        };
+      }
+
+      const progressToken = extra._meta?.progressToken;
+      const sendProgress = async (step: string, progress: number, total: number) => {
+        if (progressToken !== undefined) {
+          await extra.sendNotification({
+            method: "notifications/progress" as const,
+            params: { progressToken, progress, total, message: step },
+          });
+        }
+      };
+
+      // Read all images into buffers
+      const totalSteps = files.length + 1;
+      const frameBuffers: Buffer[] = [];
+      for (let i = 0; i < files.length; i++) {
+        await sendProgress(`Reading ${files[i]}`, i + 1, totalSteps);
+        frameBuffers.push(fs.readFileSync(path.join(folder, files[i])));
+      }
+
+      // Detect dimensions from first image
+      const firstMeta = await sharp(frameBuffers[0]).metadata();
+      const outW = args.width ?? 800;
+      const outH = Math.round(outW * ((firstMeta.height ?? 600) / (firstMeta.width ?? 800)));
+
+      // Parse background color
+      let bg: { r: number; g: number; b: number } | null = { r: 255, g: 255, b: 255 };
+      if (args.background === "transparent") {
+        bg = null;
+      } else if (args.background) {
+        const hex = args.background.replace("#", "");
+        bg = {
+          r: parseInt(hex.slice(0, 2), 16),
+          g: parseInt(hex.slice(2, 4), 16),
+          b: parseInt(hex.slice(4, 6), 16),
+        };
+      }
+
+      await sendProgress("Encoding GIF", files.length + 1, totalSteps);
+      const gifBuffer = await createAnimatedGif(
+        frameBuffers,
+        firstMeta.width ?? 800,
+        firstMeta.height ?? 600,
+        args.fps ?? 2,
+        {
+          width: outW,
+          height: outH,
+          background: bg,
+          loop: args.loop === true ? 0 : -1, // default: play once
+          stripBackground: false, // don't strip bg on screenshots
+        }
+      );
+
+      const outputPath = args.output ?? path.join(folder, "animation.gif");
+      fs.writeFileSync(outputPath, gifBuffer);
+
+      return {
+        content: [{
+          type: "text" as const,
+          text: [
+            `Created animated GIF:`,
+            `  File: ${outputPath}`,
+            `  Frames: ${files.length}`,
+            `  Size: ${outW}x${outH}`,
+            `  FPS: ${args.fps ?? 2}`,
+            `  Loop: ${args.loop === true ? "infinite" : "play once"}`,
+            `  File size: ${(gifBuffer.length / 1024).toFixed(0)} KB`,
+          ].join("\n"),
+        }],
+      };
     }
   );
 

@@ -120,17 +120,21 @@ export function saveSpriteSheetMeta(
 }
 
 /**
- * Strip near-white/light background pixels to true transparency.
- * gpt-image-2 doesn't support background: "transparent", so it renders
- * sprites on a light background. This converts those pixels to alpha=0.
+ * Strip background pixels to true transparency using a two-pass approach:
  *
- * Threshold: pixels where R, G, B are all above the threshold get their
- * alpha set to 0. Default 240 catches white and near-white backgrounds
- * without eating into the sprite edges.
+ * Pass 1: Any pixel where R, G, B are all above the light threshold (default 220)
+ *         gets alpha set to 0. This catches white, off-white, and light gray backgrounds
+ *         that gpt-image-2 renders behind sprites.
+ *
+ * Pass 2: Snap semi-transparent pixels to fully transparent or fully opaque.
+ *         GIF format only supports binary transparency, so antialiased edges with
+ *         partial alpha (e.g., alpha=128) look wrong. Pixels below the alpha cutoff
+ *         become fully transparent; above become fully opaque.
  */
 export async function removeBackground(
   buffer: Buffer,
-  threshold: number = 240
+  lightThreshold: number = 220,
+  alphaCutoff: number = 128
 ): Promise<Buffer> {
   const image = sharp(buffer);
   const { width, height } = await image.metadata();
@@ -147,8 +151,17 @@ export async function removeBackground(
     const r = pixels[i];
     const g = pixels[i + 1];
     const b = pixels[i + 2];
-    if (r > threshold && g > threshold && b > threshold) {
-      pixels[i + 3] = 0; // set alpha to 0
+    const a = pixels[i + 3];
+
+    // Pass 1: light background pixels -> fully transparent
+    if (r > lightThreshold && g > lightThreshold && b > lightThreshold) {
+      pixels[i + 3] = 0;
+      continue;
+    }
+
+    // Pass 2: snap semi-transparent pixels to binary
+    if (a > 0 && a < 255) {
+      pixels[i + 3] = a >= alphaCutoff ? 255 : 0;
     }
   }
 
