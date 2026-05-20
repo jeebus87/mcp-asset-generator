@@ -19,14 +19,14 @@ const ANIMATION_PRESETS: Record<string, string[]> = {
     "standing still, subtle weight shift to right foot",
   ],
   walk: [
-    "walking, right foot forward, left arm forward, contact pose",
-    "walking, right foot forward, body lowering, passing position",
-    "walking, right leg extended back, left leg forward, low point",
-    "walking, pushing off right foot, body rising",
-    "walking, left foot forward, right arm forward, contact pose",
-    "walking, left foot forward, body lowering, passing position",
-    "walking, left leg extended back, right leg forward, low point",
-    "walking, pushing off left foot, body rising",
+    "walking, RIGHT leg stretched far forward with foot flat on ground, LEFT leg far behind pushing off with heel raised, wide stride, arms swinging opposite to legs, body leaning forward",
+    "walking, RIGHT foot planted ahead, LEFT foot lifting off ground behind, body weight shifting forward over right leg, knees visibly bent",
+    "walking, legs passing each other at midpoint, RIGHT leg under body bearing weight, LEFT leg swinging forward with knee high, body upright",
+    "walking, LEFT leg now reaching forward with knee extending, RIGHT leg behind starting to push off, arms switching sides mid-swing",
+    "walking, LEFT leg stretched far forward with foot flat on ground, RIGHT leg far behind pushing off with heel raised, wide stride, mirror of first pose",
+    "walking, LEFT foot planted ahead, RIGHT foot lifting off ground behind, body weight shifting forward over left leg, knees visibly bent",
+    "walking, legs passing each other at midpoint, LEFT leg under body bearing weight, RIGHT leg swinging forward with knee high, body upright",
+    "walking, RIGHT leg now reaching forward with knee extending, LEFT leg behind starting to push off, arms switching sides mid-swing",
   ],
   run: [
     "running, right foot striking ground, left arm forward, dynamic pose",
@@ -88,17 +88,28 @@ export function generateFramePrompts(
 
   const preset = ANIMATION_PRESETS[animation.toLowerCase()];
   if (preset) {
-    // Use preset, cycling if frameCount differs from preset length
     return Array.from({ length: frameCount }, (_, i) => {
       const poseIndex = i % preset.length;
-      return `${baseDescription}, frame ${i + 1} of ${frameCount} ${animation} animation, ${preset[poseIndex]}`;
+      if (i === 0) {
+        // Frame 1: generated from scratch, full description
+        return `${baseDescription}, ${animation} animation, ${preset[poseIndex]}`;
+      }
+      // Frames 2+: edited from frame 1, emphasize pose change
+      return `Change the pose of this character to: ${preset[poseIndex]}. ` +
+        `Keep the same character, same outfit, same art style. ` +
+        `ONLY change the body pose, leg positions, and arm positions. ` +
+        `The legs and arms MUST be in a clearly different position than the original.`;
     });
   }
 
   // No preset and no custom descriptions: generate generic frame variation
   return Array.from({ length: frameCount }, (_, i) => {
-    return `${baseDescription}, frame ${i + 1} of ${frameCount} ${animation} animation, ` +
-      `distinct pose showing phase ${i + 1} of the ${animation} motion`;
+    if (i === 0) {
+      return `${baseDescription}, ${animation} animation, neutral starting pose`;
+    }
+    return `Change the pose of this character to: phase ${i + 1} of ${frameCount} ` +
+      `in a ${animation} motion. Keep the same character, same outfit, same art style. ` +
+      `ONLY change the body pose. The legs and arms MUST be in a clearly different position.`;
   });
 }
 

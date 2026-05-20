@@ -20,24 +20,27 @@ describe("generateFramePrompts", () => {
       expect(prompts).toHaveLength(4);
     });
 
-    it("every prompt starts with the base description", () => {
+    it("frame 1 starts with base description, frames 2+ are edit instructions", () => {
       const prompts = generateFramePrompts(base, "walk", 8);
-      for (const prompt of prompts) {
-        expect(prompt).toMatch(new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      // Frame 1: generated from scratch, includes base description
+      expect(prompts[0]).toContain(base);
+      // Frames 2+: edit instructions, don't include base description
+      for (let i = 1; i < prompts.length; i++) {
+        expect(prompts[i]).toContain("Change the pose");
+        expect(prompts[i]).toContain("MUST be in a clearly different position");
       }
     });
 
-    it("includes frame number in each prompt", () => {
+    it("frame 1 includes animation context", () => {
       const prompts = generateFramePrompts(base, "run", 6);
-      for (let i = 0; i < 6; i++) {
-        expect(prompts[i]).toContain(`frame ${i + 1} of 6`);
-      }
+      expect(prompts[0]).toContain("run");
+      expect(prompts[0]).toContain(base);
     });
 
-    it("includes animation name in each prompt", () => {
+    it("edit frames describe specific poses", () => {
       const prompts = generateFramePrompts(base, "attack", 4);
-      for (const prompt of prompts) {
-        expect(prompt).toContain("attack");
+      for (let i = 1; i < 4; i++) {
+        expect(prompts[i]).toContain("Change the pose");
       }
     });
 
@@ -96,10 +99,13 @@ describe("generateFramePrompts", () => {
     it("generates generic pose variations", () => {
       const prompts = generateFramePrompts(base, "backflip", 4);
       expect(prompts).toHaveLength(4);
-      for (let i = 0; i < 4; i++) {
-        expect(prompts[i]).toContain(base);
+      // Frame 1: base description with animation name
+      expect(prompts[0]).toContain(base);
+      expect(prompts[0]).toContain("backflip");
+      // Frames 2+: edit instructions
+      for (let i = 1; i < 4; i++) {
+        expect(prompts[i]).toContain("Change the pose");
         expect(prompts[i]).toContain("backflip");
-        expect(prompts[i]).toContain(`frame ${i + 1} of 4`);
       }
     });
   });
