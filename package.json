@@ -15,7 +15,8 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "vitest run"
   },
   "keywords": [
     "mcp",
@@ -40,7 +41,8 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/sharp": "^0.31.1",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.7"
   },
   "engines": {
     "node": ">=18.0.0"

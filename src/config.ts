@@ -17,7 +17,7 @@ export function loadConfig(): ServerConfig {
 
   return {
     openaiApiKey,
-    imageModel: process.env.OPENAI_IMAGE_MODEL || "gpt-image-1",
+    imageModel: process.env.OPENAI_IMAGE_MODEL || "gpt-image-2",
     outputBaseDir: process.env.ASSET_OUTPUT_DIR || "assets",
   };
 }

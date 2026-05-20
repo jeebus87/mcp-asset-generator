@@ -1,0 +1,198 @@
+import sharp from "sharp";
+import { ImageGenerator } from "./generator.js";
+import type { QualityTier } from "./types.js";
+
+/**
+ * Per-frame pose descriptions for common animation types.
+ * Each entry describes how the character should look in that frame.
+ */
+const ANIMATION_PRESETS: Record<string, string[]> = {
+  idle: [
+    "standing still, neutral pose, arms relaxed at sides",
+    "standing still, very slight lean forward",
+    "standing still, subtle breathing motion, chest slightly expanded",
+    "standing still, very slight lean backward",
+    "standing still, neutral pose, arms relaxed at sides",
+    "standing still, subtle weight shift to left foot",
+    "standing still, subtle breathing motion, chest slightly contracted",
+    "standing still, subtle weight shift to right foot",
+  ],
+  walk: [
+    "walking, right foot forward, left arm forward, contact pose",
+    "walking, right foot forward, body lowering, passing position",
+    "walking, right leg extended back, left leg forward, low point",
+    "walking, pushing off right foot, body rising",
+    "walking, left foot forward, right arm forward, contact pose",
+    "walking, left foot forward, body lowering, passing position",
+    "walking, left leg extended back, right leg forward, low point",
+    "walking, pushing off left foot, body rising",
+  ],
+  run: [
+    "running, right foot striking ground, left arm forward, dynamic pose",
+    "running, airborne, right leg behind, left leg tucked",
+    "running, left foot striking ground, right arm forward",
+    "running, airborne, left leg behind, right leg tucked",
+    "running, right foot forward, arms pumping",
+    "running, flight phase, both feet off ground, leaning forward",
+    "running, left foot forward, arms pumping opposite",
+    "running, flight phase, maximum stride extension",
+  ],
+  attack: [
+    "attack windup, weapon raised behind, weight on back foot",
+    "attack windup, weapon at highest point, body coiled",
+    "attacking, weapon swinging forward, body rotating",
+    "attacking, weapon at mid-swing, maximum speed pose",
+    "attack impact, weapon extended forward, body fully rotated",
+    "attack follow-through, weapon past target, momentum carrying",
+    "attack recovery, pulling weapon back, recentering weight",
+    "returning to ready stance, weapon at guard position",
+  ],
+  jump: [
+    "preparing to jump, knees bending, crouching down",
+    "launching upward, legs extending, arms rising",
+    "ascending, body fully extended, arms up",
+    "peak of jump, floating, legs slightly tucked",
+    "beginning descent, body tilting slightly forward",
+    "falling, legs extending downward, arms out for balance",
+    "landing impact, knees bent, absorbing force",
+    "recovery from landing, standing back up",
+  ],
+};
+
+export interface PerFrameParams {
+  prompt: string;
+  animation: string;
+  frameCount: number;
+  frameDescriptions?: string[];
+  quality?: QualityTier;
+  background?: "transparent" | "opaque";
+  outputDir?: string;
+}
+
+/**
+ * Build per-frame prompts with consistent character base + varying poses.
+ */
+export function generateFramePrompts(
+  baseDescription: string,
+  animation: string,
+  frameCount: number,
+  customDescriptions?: string[]
+): string[] {
+  if (customDescriptions && customDescriptions.length >= frameCount) {
+    // User provided explicit per-frame descriptions
+    return customDescriptions.slice(0, frameCount).map(
+      (desc) => `${baseDescription}, ${desc}`
+    );
+  }
+
+  const preset = ANIMATION_PRESETS[animation.toLowerCase()];
+  if (preset) {
+    // Use preset, cycling if frameCount differs from preset length
+    return Array.from({ length: frameCount }, (_, i) => {
+      const poseIndex = i % preset.length;
+      return `${baseDescription}, frame ${i + 1} of ${frameCount} ${animation} animation, ${preset[poseIndex]}`;
+    });
+  }
+
+  // No preset and no custom descriptions: generate generic frame variation
+  return Array.from({ length: frameCount }, (_, i) => {
+    return `${baseDescription}, frame ${i + 1} of ${frameCount} ${animation} animation, ` +
+      `distinct pose showing phase ${i + 1} of the ${animation} motion`;
+  });
+}
+
+/**
+ * Generate each frame individually via separate API calls.
+ * Sequential to avoid rate limits.
+ */
+export async function generateFrames(
+  generator: ImageGenerator,
+  params: PerFrameParams,
+  onProgress?: (step: string, progress: number, total: number) => void
+): Promise<Buffer[]> {
+  const prompts = generateFramePrompts(
+    params.prompt,
+    params.animation,
+    params.frameCount,
+    params.frameDescriptions
+  );
+
+  const totalSteps = params.frameCount + 1; // +1 for stitching
+  const buffers: Buffer[] = [];
+
+  for (let i = 0; i < prompts.length; i++) {
+    onProgress?.(
+      `Generating frame ${i + 1}/${params.frameCount}`,
+      i + 1,
+      totalSteps
+    );
+
+    const result = await generator.generate({
+      prompt: prompts[i],
+      type: "game_sprite",
+      quality: params.quality,
+      background: params.background ?? "transparent",
+      outputDir: params.outputDir,
+    });
+
+    // Read the generated file into a buffer
+    const fs = await import("node:fs");
+    const frameBuffer = fs.readFileSync(result.filePath);
+    buffers.push(frameBuffer);
+
+    // Clean up individual frame file -- only the final stitched sheet matters
+    try {
+      fs.unlinkSync(result.filePath);
+    } catch {
+      // Non-critical if cleanup fails
+    }
+  }
+
+  return buffers;
+}
+
+/**
+ * Stitch individual frame buffers into a grid sprite sheet.
+ */
+export async function stitchFrames(
+  frameBuffers: Buffer[],
+  columns: number,
+  frameWidth: number,
+  frameHeight: number
+): Promise<Buffer> {
+  const rows = Math.ceil(frameBuffers.length / columns);
+  const sheetWidth = columns * frameWidth;
+  const sheetHeight = rows * frameHeight;
+
+  // Resize each frame to exact target size and build composite list
+  const composites: sharp.OverlayOptions[] = [];
+
+  for (let i = 0; i < frameBuffers.length; i++) {
+    const col = i % columns;
+    const row = Math.floor(i / columns);
+
+    const resizedFrame = await sharp(frameBuffers[i])
+      .resize(frameWidth, frameHeight, { fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .png()
+      .toBuffer();
+
+    composites.push({
+      input: resizedFrame,
+      left: col * frameWidth,
+      top: row * frameHeight,
+    });
+  }
+
+  // Create transparent base canvas and composite all frames
+  return sharp({
+    create: {
+      width: sheetWidth,
+      height: sheetHeight,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite(composites)
+    .png()
+    .toBuffer();
+}

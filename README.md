@@ -4,7 +4,7 @@ An MCP server that turns rough text descriptions into production-ready visual as
 
 Works with any MCP-compatible client (Claude Desktop, Claude Code, Cursor, etc.) and uses OpenAI's image generation API under the hood.
 
-**17 tools.** Logos, icons, banners, favicons, OG images, illustrations, email headers, print newsletters, game sprites, game characters, game backgrounds, game UI, sprite sheet animations with JSON metadata, a smart router that picks the right tool from your description, and codebase wiring that finds where to plug the asset in and does it for you.
+**18 tools.** Logos, icons, banners, favicons, OG images, illustrations, email headers, print newsletters, game sprites, game characters, game backgrounds, game UI, sprite sheet animations with JSON metadata (single-image or per-frame high-quality), a smart router that picks the right tool from your description, and codebase wiring that finds where to plug the asset in and does it for you.
 
 ## What it generates
 
@@ -221,9 +221,10 @@ npx mcp-asset-generator
 | `generate_game_character` | Full-body character concept art. | 1024x1536 | Transparent |
 | `generate_game_background` | Level backgrounds, environments, scenes. | 1536x1024 | Opaque |
 | `generate_game_ui` | UI elements. Buttons, frames, panels, HUD. | 1024x1024 | Transparent |
-| `generate_sprite_sheet` | Animated sprite sheets with JSON metadata. | 1024x1024 | Transparent |
+| `generate_sprite_sheet` | Animated sprite sheets with JSON metadata (single image). | 1024x1024 | Transparent |
+| `generate_sprite_sheet_hq` | High-quality sprite sheets -- each frame generated individually. | 1024x1024/frame | Transparent |
 
-The sprite sheet tool accepts extra parameters:
+Both sprite sheet tools accept extra parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -232,7 +233,19 @@ The sprite sheet tool accepts extra parameters:
 | `columns` | `4` | Grid columns |
 | `fps` | `12` | Playback speed |
 
-It generates both a PNG sprite sheet and a companion `.json` file compatible with Phaser, Unity, Godot, Pixi.js, and any engine that reads TexturePacker format.
+Both generate a PNG sprite sheet and a companion `.json` file compatible with Phaser, Unity, Godot, Pixi.js, and any engine that reads TexturePacker format.
+
+The HQ variant (`generate_sprite_sheet_hq`) also accepts:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `frame_descriptions` | *(auto)* | Per-frame pose descriptions. Overrides built-in presets. |
+
+Built-in animation presets for `generate_sprite_sheet_hq`: `idle`, `walk`, `run`, `attack`, `jump`. These provide frame-specific pose directions automatically. For custom animations, supply `frame_descriptions` or the tool generates generic pose variations.
+
+**When to use which:**
+- `generate_sprite_sheet` -- fast, cheap (1 API call), good enough for prototyping
+- `generate_sprite_sheet_hq` -- slow, ~Nx cost (1 API call per frame), better pose variety and quality
 
 The print newsletter tool uses structured content instead of a single prompt:
 
@@ -294,7 +307,7 @@ The art direction layer is what separates this from calling the API directly. A 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `OPENAI_IMAGE_MODEL` | `gpt-image-1` | Which model to use |
+| `OPENAI_IMAGE_MODEL` | `gpt-image-2` | Which model to use |
 | `ASSET_OUTPUT_DIR` | `assets` | Where generated files go |
 
 ## Output structure

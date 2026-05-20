@@ -20,6 +20,10 @@ import {
   applyWiringChanges,
   type WiringProposal,
 } from "./wiring.js";
+import {
+  generateFrames,
+  stitchFrames,
+} from "./sprite-frames.js";
 
 const ASSET_TYPE_ENUM = [
   "logo",
@@ -631,6 +635,163 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       }
 
       return result;
+    }
+  );
+
+  // Per-frame sprite sheet: generates each frame individually for higher quality
+  server.tool(
+    "generate_sprite_sheet_hq",
+    "Generate a high-quality sprite sheet by rendering each animation frame as a separate " +
+      "image, then stitching them into a grid. Produces smoother animations with fewer " +
+      "duplicate poses than single-image generation. Costs ~Nx more API calls (one per frame) " +
+      "but each frame gets individual attention. Includes a companion JSON metadata file.",
+    {
+      prompt: z
+        .string()
+        .describe(
+          "Base character/object description that stays consistent across all frames. " +
+            "Example: 'a pixel-art goblin warrior with green skin and rusty armor'"
+        ),
+      animation: z
+        .string()
+        .optional()
+        .describe(
+          "Animation type. Built-in presets: 'idle', 'walk', 'run', 'attack', 'jump'. " +
+            "Or any custom name -- provide frame_descriptions for custom animations. " +
+            "Defaults to 'idle'."
+        ),
+      frame_descriptions: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Override auto-generated per-frame poses. Each string describes the pose for " +
+            "that frame. Must have at least as many entries as the frame count."
+        ),
+      frames: z
+        .number()
+        .int()
+        .min(2)
+        .max(16)
+        .optional()
+        .describe("Number of animation frames (2-16). Defaults to 8."),
+      columns: z
+        .number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .describe("Grid columns in the output sprite sheet. Defaults to 4."),
+      fps: z
+        .number()
+        .int()
+        .min(1)
+        .max(60)
+        .optional()
+        .describe("Playback speed in frames per second for metadata. Defaults to 12."),
+      quality: z
+        .enum(["low", "medium", "high"])
+        .optional()
+        .describe("Quality tier for each frame generation. Defaults to high."),
+      background: z
+        .enum(["transparent", "opaque"])
+        .optional()
+        .describe("Background type for each frame. Defaults to transparent."),
+    },
+    GENERATION_ANNOTATIONS,
+    async (args, extra) => {
+      const frameCount = args.frames ?? 8;
+      const columns = args.columns ?? 4;
+      const rows = Math.ceil(frameCount / columns);
+      const animName = args.animation ?? "idle";
+      const fps = args.fps ?? 12;
+
+      const totalSteps = frameCount + 2; // frames + stitch + save
+
+      const sendProgress = async (step: string, progress: number, total: number) => {
+        const progressToken = extra._meta?.progressToken;
+        if (progressToken !== undefined) {
+          await extra.sendNotification({
+            method: "notifications/progress" as const,
+            params: { progressToken, progress, total, message: step },
+          });
+        }
+      };
+
+      try {
+        // Generate each frame individually
+        const frameBuffers = await generateFrames(
+          generator,
+          {
+            prompt: args.prompt,
+            animation: animName,
+            frameCount,
+            frameDescriptions: args.frame_descriptions,
+            quality: args.quality as QualityTier | undefined,
+            background: args.background as "transparent" | "opaque" | undefined,
+          },
+          (step, progress, _total) => {
+            sendProgress(step, progress, totalSteps);
+          }
+        );
+
+        // Stitch frames into grid
+        await sendProgress("Stitching frames into sprite sheet", frameCount + 1, totalSteps);
+
+        // Each frame is 1024x1024 (game_sprite default), compute grid dimensions
+        const frameWidth = 1024;
+        const frameHeight = 1024;
+        const sheetBuffer = await stitchFrames(frameBuffers, columns, frameWidth, frameHeight);
+
+        // Save the final sprite sheet
+        await sendProgress("Saving sprite sheet and metadata", frameCount + 2, totalSteps);
+        const outputDir = process.env.ASSET_OUTPUT_DIR || "assets";
+        const filePath = saveImage(sheetBuffer, "sprite_sheet", args.prompt, outputDir);
+
+        // Generate JSON metadata (same format as standard sprite sheet)
+        const jsonPath = saveSpriteSheetMeta(filePath, {
+          animation: animName,
+          frameWidth,
+          frameHeight,
+          columns,
+          rows,
+          frameCount,
+          fps,
+        });
+
+        const sheetWidth = columns * frameWidth;
+        const sheetHeight = rows * frameHeight;
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Generated high-quality sprite sheet (per-frame rendering):\n` +
+                `  File: ${filePath}\n` +
+                `  Dimensions: ${sheetWidth}x${sheetHeight}\n` +
+                `  Frames: ${frameCount} (${columns}x${rows} grid)\n` +
+                `  Frame size: ${frameWidth}x${frameHeight}px\n` +
+                `  Animation: "${animName}" at ${fps} FPS\n` +
+                `  JSON metadata: ${jsonPath}\n` +
+                `  API calls: ${frameCount} (one per frame)\n\n` +
+                `Each frame was generated individually with consistent character ` +
+                `description and frame-specific pose directions.`,
+            },
+          ],
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        const errorCode = error instanceof GenerationError ? error.code : "unknown";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Per-frame sprite sheet generation failed [${errorCode}]: ${message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
