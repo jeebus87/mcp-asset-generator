@@ -11,6 +11,7 @@ import * as dotenv from "dotenv";
 import { ImageGenerator } from "../src/generator.js";
 import { generateFrames, stitchFrames, generateFramePrompts } from "../src/sprite-frames.js";
 import { saveImage, saveSpriteSheetMeta } from "../src/files.js";
+import { createAnimatedGif } from "../src/gif.js";
 import { loadConfig } from "../src/config.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -110,11 +111,22 @@ async function main() {
   console.error(`JSON frames: ${Object.keys(jsonData.frames).length}`);
   console.error(`JSON animation: ${JSON.stringify(jsonData.animations)}`);
 
+  // Step 7: Generate animated GIF
+  console.error("");
+  console.error("=== GIF Generation ===");
+  const gifBuffer = await createAnimatedGif(frameBuffers, frameWidth, frameHeight, fps);
+  const gifPath = outPath.replace(/\.png$/, ".gif");
+  fs.writeFileSync(gifPath, gifBuffer);
+  console.error(`GIF saved: ${gifPath}`);
+  console.error(`GIF size: ${gifBuffer.length} bytes`);
+  console.error(`GIF magic: ${gifBuffer.slice(0, 6).toString("ascii")}`);
+
   const pass =
     meta.width === columns * frameWidth &&
     meta.height === Math.ceil(frameCount / columns) * frameHeight &&
     meta.channels === 4 &&
-    Object.keys(jsonData.frames).length === frameCount;
+    Object.keys(jsonData.frames).length === frameCount &&
+    gifBuffer.slice(0, 6).toString("ascii") === "GIF89a";
 
   console.error("");
   console.error(pass ? "PASS -- all checks passed" : "FAIL -- see above");

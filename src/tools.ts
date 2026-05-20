@@ -24,6 +24,7 @@ import {
   generateFrames,
   stitchFrames,
 } from "./sprite-frames.js";
+import { createAnimatedGif } from "./gif.js";
 
 const ASSET_TYPE_ENUM = [
   "logo",
@@ -696,6 +697,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         .enum(["transparent", "opaque"])
         .optional()
         .describe("Background type for each frame. Defaults to transparent."),
+      gif: z
+        .boolean()
+        .optional()
+        .describe("Also generate an animated GIF preview alongside the sprite sheet. Defaults to true."),
     },
     GENERATION_ANNOTATIONS,
     async (args, extra) => {
@@ -705,7 +710,8 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       const animName = args.animation ?? "idle";
       const fps = args.fps ?? 12;
 
-      const totalSteps = frameCount + 2; // frames + stitch + save
+      const wantGif = args.gif !== false; // default true
+      const totalSteps = frameCount + 2 + (wantGif ? 1 : 0); // frames + stitch + save + gif
 
       const sendProgress = async (step: string, progress: number, total: number) => {
         const progressToken = extra._meta?.progressToken;
@@ -761,22 +767,37 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         const sheetWidth = columns * frameWidth;
         const sheetHeight = rows * frameHeight;
 
+        // Generate animated GIF preview
+        let gifPath: string | null = null;
+        if (wantGif) {
+          await sendProgress("Creating animated GIF preview", frameCount + 3, totalSteps);
+          const gifBuffer = await createAnimatedGif(frameBuffers, frameWidth, frameHeight, fps);
+          gifPath = filePath.replace(/\.png$/, ".gif");
+          fs.writeFileSync(gifPath, gifBuffer);
+        }
+
+        const output = [
+          `Generated high-quality sprite sheet (per-frame rendering):`,
+          `  File: ${filePath}`,
+          `  Dimensions: ${sheetWidth}x${sheetHeight}`,
+          `  Frames: ${frameCount} (${columns}x${rows} grid)`,
+          `  Frame size: ${frameWidth}x${frameHeight}px`,
+          `  Animation: "${animName}" at ${fps} FPS`,
+          `  JSON metadata: ${jsonPath}`,
+        ];
+        if (gifPath) {
+          output.push(`  GIF preview: ${gifPath}`);
+        }
+        output.push(
+          `  API calls: ${frameCount} (one per frame)`,
+          ``,
+          `Each frame was generated individually with consistent character`,
+          `description and frame-specific pose directions.`,
+        );
+
         return {
           content: [
-            {
-              type: "text" as const,
-              text:
-                `Generated high-quality sprite sheet (per-frame rendering):\n` +
-                `  File: ${filePath}\n` +
-                `  Dimensions: ${sheetWidth}x${sheetHeight}\n` +
-                `  Frames: ${frameCount} (${columns}x${rows} grid)\n` +
-                `  Frame size: ${frameWidth}x${frameHeight}px\n` +
-                `  Animation: "${animName}" at ${fps} FPS\n` +
-                `  JSON metadata: ${jsonPath}\n` +
-                `  API calls: ${frameCount} (one per frame)\n\n` +
-                `Each frame was generated individually with consistent character ` +
-                `description and frame-specific pose directions.`,
-            },
+            { type: "text" as const, text: output.join("\n") },
           ],
         };
       } catch (error: unknown) {
