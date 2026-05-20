@@ -1,5 +1,6 @@
 import sharp from "sharp";
 import { ImageGenerator } from "./generator.js";
+import { removeBackground } from "./files.js";
 import type { QualityTier } from "./types.js";
 
 /**
@@ -156,11 +157,16 @@ export async function generateFrames(
       totalSteps
     );
 
-    const editedBuffer = await generator.editImage(
+    let editedBuffer = await generator.editImage(
       baseFrameBuffer,
       prompts[i],
       { quality: params.quality, size: "1024x1024" }
     );
+
+    // Strip background to true alpha (edit API doesn't support transparent param)
+    if (params.background === "transparent" || params.background === undefined) {
+      editedBuffer = await removeBackground(editedBuffer);
+    }
     buffers.push(editedBuffer);
   }
 

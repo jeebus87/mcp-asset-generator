@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import sharp from "sharp";
 import { AssetType } from "./types.js";
 
 const TYPE_FOLDERS: Record<AssetType, string> = {
@@ -116,4 +117,44 @@ export function saveSpriteSheetMeta(
 
   fs.writeFileSync(jsonPath, JSON.stringify(output, null, 2));
   return jsonPath;
+}
+
+/**
+ * Strip near-white/light background pixels to true transparency.
+ * gpt-image-2 doesn't support background: "transparent", so it renders
+ * sprites on a light background. This converts those pixels to alpha=0.
+ *
+ * Threshold: pixels where R, G, B are all above the threshold get their
+ * alpha set to 0. Default 240 catches white and near-white backgrounds
+ * without eating into the sprite edges.
+ */
+export async function removeBackground(
+  buffer: Buffer,
+  threshold: number = 240
+): Promise<Buffer> {
+  const image = sharp(buffer);
+  const { width, height } = await image.metadata();
+  if (!width || !height) return buffer;
+
+  const { data, info } = await image
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const pixels = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i];
+    const g = pixels[i + 1];
+    const b = pixels[i + 2];
+    if (r > threshold && g > threshold && b > threshold) {
+      pixels[i + 3] = 0; // set alpha to 0
+    }
+  }
+
+  return sharp(Buffer.from(pixels), {
+    raw: { width: info.width, height: info.height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
 }
