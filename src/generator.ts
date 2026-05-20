@@ -14,7 +14,7 @@ import { classifyApiError } from "./errors.js";
 
 type ApiSize = NonNullable<ImageGenerateParams["size"]>;
 
-// gpt-image-2 supported sizes
+// gpt-image-1 supported sizes
 const API_SIZES: [ApiSize, number, number][] = [
   ["1024x1024", 1024, 1024],
   ["1536x1024", 1536, 1024],
