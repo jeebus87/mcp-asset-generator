@@ -230,25 +230,25 @@ describe("stitchFrames", () => {
 });
 
 describe("generateFrames", () => {
-  it("calls generator.generate once per frame and returns buffers", async () => {
+  it("calls generate once for frame 1, then editImage for remaining frames", async () => {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const os = await import("node:os");
 
-    // Create a temp directory for fake generated files
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-test-"));
 
-    // Create a tiny valid PNG to use as fake output
     const { default: sharp } = await import("sharp");
     const fakePng = await sharp({
       create: { width: 16, height: 16, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 255 } },
     }).png().toBuffer();
 
-    let callCount = 0;
+    const editPng = await sharp({
+      create: { width: 16, height: 16, channels: 4, background: { r: 0, g: 255, b: 0, alpha: 255 } },
+    }).png().toBuffer();
+
     const mockGenerator = {
       generate: vi.fn(async (params: any) => {
-        callCount++;
-        const filePath = path.join(tmpDir, `frame-${callCount}.png`);
+        const filePath = path.join(tmpDir, `frame-1.png`);
         fs.writeFileSync(filePath, fakePng);
         return {
           filePath,
@@ -262,6 +262,7 @@ describe("generateFrames", () => {
           generationParams: {},
         };
       }),
+      editImage: vi.fn(async () => editPng),
     } as any;
 
     const progressCalls: [string, number, number][] = [];
@@ -278,8 +279,10 @@ describe("generateFrames", () => {
       }
     );
 
-    // Should have called generate 3 times
-    expect(mockGenerator.generate).toHaveBeenCalledTimes(3);
+    // Frame 1: generate from scratch
+    expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
+    // Frames 2-3: edit from frame 1
+    expect(mockGenerator.editImage).toHaveBeenCalledTimes(2);
 
     // Should return 3 buffers
     expect(buffers).toHaveLength(3);
@@ -288,24 +291,62 @@ describe("generateFrames", () => {
       expect(buf.length).toBeGreaterThan(0);
     }
 
-    // Progress should have been called for each frame
+    // Progress: 1 for base frame + 2 for edits = 3
     expect(progressCalls).toHaveLength(3);
-    expect(progressCalls[0][0]).toContain("frame 1/3");
+    expect(progressCalls[0][0]).toContain("base frame");
+    expect(progressCalls[1][0]).toContain("frame 2/3");
     expect(progressCalls[2][0]).toContain("frame 3/3");
 
-    // Temp frame files should have been cleaned up
+    // Temp frame file for frame 1 should have been cleaned up
     const remaining = fs.readdirSync(tmpDir);
     expect(remaining).toHaveLength(0);
 
-    // Cleanup
     fs.rmdirSync(tmpDir);
   });
 
-  it("propagates generator errors with context", async () => {
+  it("editImage receives the base frame buffer as source", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const os = await import("node:os");
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-test2-"));
+
+    const { default: sharp } = await import("sharp");
+    const basePng = await sharp({
+      create: { width: 16, height: 16, channels: 4, background: { r: 100, g: 100, b: 100, alpha: 255 } },
+    }).png().toBuffer();
+
+    const mockGenerator = {
+      generate: vi.fn(async () => {
+        const filePath = path.join(tmpDir, `base.png`);
+        fs.writeFileSync(filePath, basePng);
+        return { filePath, width: 1024, height: 1024, model: "gpt-image-2",
+          quality: "high", enhancedPrompt: "", originalPrompt: "",
+          type: "game_sprite", generationParams: {} };
+      }),
+      editImage: vi.fn(async (sourceBuffer: Buffer) => {
+        // Verify the source buffer is the base frame
+        expect(sourceBuffer).toEqual(basePng);
+        return basePng;
+      }),
+    } as any;
+
+    await generateFrames(mockGenerator, {
+      prompt: "test",
+      animation: "walk",
+      frameCount: 2,
+    });
+
+    expect(mockGenerator.editImage).toHaveBeenCalledTimes(1);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("propagates generator errors on frame 1", async () => {
     const mockGenerator = {
       generate: vi.fn(async () => {
         throw new Error("API rate limit exceeded");
       }),
+      editImage: vi.fn(),
     } as any;
 
     await expect(
@@ -316,7 +357,44 @@ describe("generateFrames", () => {
       })
     ).rejects.toThrow("API rate limit exceeded");
 
-    // Should have only called generate once (fails on first frame)
     expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
+    expect(mockGenerator.editImage).not.toHaveBeenCalled();
+  });
+
+  it("propagates editImage errors on subsequent frames", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-test3-"));
+
+    const { default: sharp } = await import("sharp");
+    const fakePng = await sharp({
+      create: { width: 16, height: 16, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 255 } },
+    }).png().toBuffer();
+
+    const mockGenerator = {
+      generate: vi.fn(async () => {
+        const filePath = path.join(tmpDir, `base.png`);
+        fs.writeFileSync(filePath, fakePng);
+        return { filePath, width: 1024, height: 1024, model: "gpt-image-2",
+          quality: "high", enhancedPrompt: "", originalPrompt: "",
+          type: "game_sprite", generationParams: {} };
+      }),
+      editImage: vi.fn(async () => {
+        throw new Error("Edit API failed");
+      }),
+    } as any;
+
+    await expect(
+      generateFrames(mockGenerator, {
+        prompt: "a test sprite",
+        animation: "walk",
+        frameCount: 3,
+      })
+    ).rejects.toThrow("Edit API failed");
+
+    expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
+    expect(mockGenerator.editImage).toHaveBeenCalledTimes(1);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 });

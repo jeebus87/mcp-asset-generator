@@ -121,7 +121,7 @@ async function generateOne(asset: ExampleAsset, index: number, total: number): P
   console.error(`[${index + 1}/${total}] Generating: ${asset.outPath} ...`);
 
   const response = await openai.images.generate({
-    model: "gpt-image-1",
+    model: "gpt-image-2",
     prompt: asset.prompt,
     n: 1,
     size: asset.size,
@@ -143,7 +143,7 @@ async function generateOne(asset: ExampleAsset, index: number, total: number): P
 
 async function main() {
   console.error(`Generating ${EXAMPLES.length} example assets...`);
-  console.error(`Using model: gpt-image-1`);
+  console.error(`Using model: gpt-image-2`);
   console.error("");
 
   for (let i = 0; i < EXAMPLES.length; i++) {

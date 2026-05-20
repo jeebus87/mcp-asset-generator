@@ -79,6 +79,7 @@ async function main() {
   console.error(`Sheet buffer: ${sheetBuffer.length} bytes`);
 
   // Step 4: Save
+  // Overwrite the old HQ version with the new edit-based version
   const outPath = path.join(PROJECT_ROOT, "examples", "game", "spritesheet-goblin-walk-hq.png");
   fs.writeFileSync(outPath, sheetBuffer);
   console.error(`Saved: ${outPath}`);

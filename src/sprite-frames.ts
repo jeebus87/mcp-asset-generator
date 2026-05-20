@@ -102,8 +102,10 @@ export function generateFramePrompts(
 }
 
 /**
- * Generate each frame individually via separate API calls.
- * Sequential to avoid rate limits.
+ * Generate each frame via separate API calls.
+ * Frame 1 is generated from scratch. Frames 2-N use the edit API with
+ * frame 1 as the source image, changing only the pose. This keeps the
+ * character visually consistent across all frames.
  */
 export async function generateFrames(
   generator: ImageGenerator,
@@ -120,32 +122,46 @@ export async function generateFrames(
   const totalSteps = params.frameCount + 1; // +1 for stitching
   const buffers: Buffer[] = [];
 
-  for (let i = 0; i < prompts.length; i++) {
+  // Frame 1: generate from scratch
+  onProgress?.(
+    `Generating base frame (1/${params.frameCount})`,
+    1,
+    totalSteps
+  );
+
+  const result = await generator.generate({
+    prompt: prompts[0],
+    type: "game_sprite",
+    quality: params.quality,
+    background: params.background ?? "transparent",
+    outputDir: params.outputDir,
+  });
+
+  const fs = await import("node:fs");
+  const baseFrameBuffer = fs.readFileSync(result.filePath);
+  buffers.push(baseFrameBuffer);
+
+  // Clean up the saved file -- only the final stitched sheet matters
+  try {
+    fs.unlinkSync(result.filePath);
+  } catch {
+    // Non-critical
+  }
+
+  // Frames 2-N: edit frame 1 to change pose while keeping character consistent
+  for (let i = 1; i < prompts.length; i++) {
     onProgress?.(
-      `Generating frame ${i + 1}/${params.frameCount}`,
+      `Editing frame ${i + 1}/${params.frameCount}`,
       i + 1,
       totalSteps
     );
 
-    const result = await generator.generate({
-      prompt: prompts[i],
-      type: "game_sprite",
-      quality: params.quality,
-      background: params.background ?? "transparent",
-      outputDir: params.outputDir,
-    });
-
-    // Read the generated file into a buffer
-    const fs = await import("node:fs");
-    const frameBuffer = fs.readFileSync(result.filePath);
-    buffers.push(frameBuffer);
-
-    // Clean up individual frame file -- only the final stitched sheet matters
-    try {
-      fs.unlinkSync(result.filePath);
-    } catch {
-      // Non-critical if cleanup fails
-    }
+    const editedBuffer = await generator.editImage(
+      baseFrameBuffer,
+      prompts[i],
+      { quality: params.quality, size: "1024x1024" }
+    );
+    buffers.push(editedBuffer);
   }
 
   return buffers;

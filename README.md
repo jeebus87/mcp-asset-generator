@@ -307,7 +307,7 @@ The art direction layer is what separates this from calling the API directly. A 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `OPENAI_IMAGE_MODEL` | `gpt-image-1` | Which model to use |
+| `OPENAI_IMAGE_MODEL` | `gpt-image-2` | Which model to use |
 | `ASSET_OUTPUT_DIR` | `assets` | Where generated files go |
 
 ## Output structure

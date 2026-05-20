@@ -19,7 +19,7 @@ describe("loadConfig", () => {
     // Dynamic import to pick up env changes
     const { loadConfig } = await import("../config.js");
     const config = loadConfig();
-    expect(config.imageModel).toBe("gpt-image-1");
+    expect(config.imageModel).toBe("gpt-image-2");
   });
 
   it("respects OPENAI_IMAGE_MODEL override", async () => {

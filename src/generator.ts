@@ -14,7 +14,7 @@ import { classifyApiError } from "./errors.js";
 
 type ApiSize = NonNullable<ImageGenerateParams["size"]>;
 
-// gpt-image-1 supported sizes
+// gpt-image-2 supported sizes
 const API_SIZES: [ApiSize, number, number][] = [
   ["1024x1024", 1024, 1024],
   ["1536x1024", 1536, 1024],
@@ -69,13 +69,22 @@ export class ImageGenerator {
     onProgress?.("Generating image via OpenAI", 2, 4);
     const size = pickClosestSize(width, height);
 
+    // gpt-image-2 does not support background: "transparent".
+    // Fall back to gpt-image-1 for asset types that need transparency.
+    const needsTransparency = background === "transparent";
+    const model = needsTransparency && this.config.imageModel === "gpt-image-2"
+      ? "gpt-image-1"
+      : this.config.imageModel;
+
     const apiParams: ImageGenerateParams = {
-      model: this.config.imageModel,
+      model,
       prompt: enhanced,
       n: 1,
       size,
       quality,
-      background: background === "transparent" ? "transparent" : "auto",
+      ...(needsTransparency && model.includes("gpt-image-1")
+        ? { background: "transparent" as const }
+        : {}),
     };
 
     let response;
@@ -112,7 +121,7 @@ export class ImageGenerator {
       filePath,
       width: actualWidth,
       height: actualHeight,
-      model: this.config.imageModel,
+      model,
       quality,
       enhancedPrompt: enhanced,
       originalPrompt: params.prompt,
@@ -121,9 +130,52 @@ export class ImageGenerator {
         size,
         quality,
         background,
-        model: this.config.imageModel,
+        model,
       },
     };
+  }
+
+  /**
+   * Edit an existing image to produce a variation with a new prompt.
+   * Used by per-frame sprite generation: generate frame 1, then edit it
+   * for subsequent frames to maintain character consistency.
+   */
+  async editImage(
+    sourceBuffer: Buffer,
+    prompt: string,
+    options?: { quality?: QualityTier; size?: "1024x1024" | "1536x1024" | "1024x1536" }
+  ): Promise<Buffer> {
+    const imageFile = new File([new Uint8Array(sourceBuffer)], "source.png", { type: "image/png" });
+
+    // Fall back to gpt-image-1 for edits that need transparency
+    const model = this.config.imageModel === "gpt-image-2"
+      ? "gpt-image-1"
+      : this.config.imageModel;
+
+    let response;
+    try {
+      response = await this.openai.images.edit({
+        model,
+        image: imageFile,
+        prompt,
+        n: 1,
+        size: options?.size ?? "1024x1024",
+        ...(model.includes("gpt-image-1")
+          ? { background: "transparent" as const }
+          : {}),
+      });
+    } catch (error) {
+      throw classifyApiError(error, prompt);
+    }
+
+    if (!response.data || response.data.length === 0) {
+      throw new Error("No image data received from edit API.");
+    }
+    const b64 = response.data[0].b64_json;
+    if (!b64) {
+      throw new Error("No b64_json in edit API response.");
+    }
+    return Buffer.from(b64, "base64");
   }
 
   async validateApiKey(): Promise<void> {
