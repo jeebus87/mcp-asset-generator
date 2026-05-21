@@ -174,7 +174,15 @@ npm install
 npm run build
 ```
 
-Then add to your MCP config, pointing to the local build:
+Create a `.env` file with your API key:
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+The project includes a `.mcp.json` that Claude Code picks up automatically. Just open the project directory in Claude Code and the tools will be available.
+
+For other MCP clients, point to the local build:
 
 ```json
 {
