@@ -236,33 +236,36 @@ export async function generateSingleSheet(
       outputFrames.push(resized);
     }
   } else {
-    // Transparent: trim and re-center for clean character sprites
+    // Transparent: pad raw cells to square without trimming.
+    // Trimming (even with a union bounding box) amplifies tiny position
+    // differences the AI produces across cells. Skipping trim preserves the
+    // exact relative positions from the original sheet.
     for (const frame of rawFrames) {
-      const trimmed = await sharp(frame)
-        .trim({ threshold: 1 })
-        .toBuffer({ resolveWithObject: true });
-
-      const centered = await sharp({
-        create: {
-          width: targetSize,
-          height: targetSize,
-          channels: 4,
+      const resized = await sharp(frame)
+        .resize(targetSize, targetSize, {
+          fit: "contain",
           background: { r: 0, g: 0, b: 0, alpha: 0 },
-        },
+        })
+        .raw()
+        .toBuffer();
+
+      // Remove white fringing: semi-transparent near-white pixels at edges
+      // that the AI renders inconsistently across frames.
+      const pixels = new Uint8Array(resized);
+      for (let i = 0; i < pixels.length; i += 4) {
+        const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
+        if (a > 0 && a < 128 && r > 200 && g > 200 && b > 200) {
+          pixels[i + 3] = 0;
+        }
+      }
+
+      const cleaned = await sharp(Buffer.from(pixels), {
+        raw: { width: targetSize, height: targetSize, channels: 4 },
       })
-        .composite([{
-          input: await sharp(trimmed.data)
-            .resize(targetSize, targetSize, {
-              fit: "contain",
-              background: { r: 0, g: 0, b: 0, alpha: 0 },
-            })
-            .toBuffer(),
-          gravity: "centre",
-        }])
         .png()
         .toBuffer();
 
-      outputFrames.push(centered);
+      outputFrames.push(cleaned);
     }
   }
 
