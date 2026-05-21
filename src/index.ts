@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { config as dotenvConfig } from "dotenv";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { loadConfig } from "./config.js";
@@ -7,6 +8,9 @@ import { ImageGenerator } from "./generator.js";
 import { registerTools } from "./tools.js";
 
 async function main() {
+  // Load .env file (if present) before reading config
+  dotenvConfig();
+
   // Load and validate configuration
   const config = loadConfig();
 
