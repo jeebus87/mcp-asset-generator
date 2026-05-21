@@ -105,6 +105,8 @@ export function buildSheetPrompt(
 
   return (
     `A sprite sheet with exactly ${gridDesc}. ` +
+    `Each frame is separated by bright solid green (#00FF00) divider lines. ` +
+    `Nothing may cross or overlap the green divider lines -- all content must stay fully inside its own cell. ` +
     `Each frame shows the same scene: ${baseDescription}. ` +
     `The frames show a ${animation} animation sequence. ` +
     `${frameList}. ` +
@@ -199,6 +201,11 @@ export async function generateSingleSheet(
   const cellHeight = Math.floor(result.height / genGrid.rows);
   const rawFrames: Buffer[] = [];
 
+  // Inset each cell by 5% to strip the green divider lines we asked the AI
+  // to draw (which keep content inside cell boundaries) plus any remaining bleed.
+  const insetX = Math.round(cellWidth * 0.05);
+  const insetY = Math.round(cellHeight * 0.05);
+
   for (let row = 0; row < genGrid.rows; row++) {
     for (let col = 0; col < genGrid.cols; col++) {
       const frameIndex = row * genGrid.cols + col;
@@ -206,10 +213,10 @@ export async function generateSingleSheet(
 
       const frame = await sharp(sheetBuffer)
         .extract({
-          left: col * cellWidth,
-          top: row * cellHeight,
-          width: cellWidth,
-          height: cellHeight,
+          left: col * cellWidth + insetX,
+          top: row * cellHeight + insetY,
+          width: cellWidth - insetX * 2,
+          height: cellHeight - insetY * 2,
         })
         .png()
         .toBuffer();
@@ -236,10 +243,9 @@ export async function generateSingleSheet(
       outputFrames.push(resized);
     }
   } else {
-    // Transparent: pad raw cells to square without trimming.
-    // Trimming (even with a union bounding box) amplifies tiny position
-    // differences the AI produces across cells. Skipping trim preserves the
-    // exact relative positions from the original sheet.
+    // Transparent: resize to square and clean up edge artifacts.
+    // Position consistency comes from the AI's single-sheet generation
+    // and the green grid lines in the prompt -- no post-processing shifts needed.
     for (const frame of rawFrames) {
       const resized = await sharp(frame)
         .resize(targetSize, targetSize, {
@@ -250,7 +256,6 @@ export async function generateSingleSheet(
         .toBuffer();
 
       // Remove white fringing: semi-transparent near-white pixels at edges
-      // that the AI renders inconsistently across frames.
       const pixels = new Uint8Array(resized);
       for (let i = 0; i < pixels.length; i += 4) {
         const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
@@ -261,9 +266,7 @@ export async function generateSingleSheet(
 
       const cleaned = await sharp(Buffer.from(pixels), {
         raw: { width: targetSize, height: targetSize, channels: 4 },
-      })
-        .png()
-        .toBuffer();
+      }).png().toBuffer();
 
       outputFrames.push(cleaned);
     }
