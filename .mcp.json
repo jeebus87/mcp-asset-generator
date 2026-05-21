@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "mcp-asset-generator": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "cwd": "."
+    }
+  }
+}
