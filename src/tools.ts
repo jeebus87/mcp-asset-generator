@@ -22,6 +22,7 @@ import {
 } from "./wiring.js";
 import {
   generateFrames,
+  generateSingleSheet,
   stitchFrames,
 } from "./sprite-frames.js";
 import { createAnimatedGif } from "./gif.js";
@@ -642,16 +643,17 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
   // Per-frame sprite sheet: generates each frame individually for higher quality
   server.tool(
     "generate_sprite_sheet_hq",
-    "Generate a high-quality sprite sheet by rendering each animation frame as a separate " +
-      "image, then stitching them into a grid. Produces smoother animations with fewer " +
-      "duplicate poses than single-image generation. Costs ~Nx more API calls (one per frame) " +
-      "but each frame gets individual attention. Includes a companion JSON metadata file.",
+    "Generate a high-quality sprite sheet with consistent character design across all frames. " +
+      "Uses a master sprite sheet approach: all frames are generated in a single image so the " +
+      "AI maintains identical proportions, colors, and style. Frames are then split, centered, " +
+      "and stitched into a clean grid. Includes animated GIF preview and JSON metadata.",
     {
       prompt: z
         .string()
         .describe(
-          "Base character/object description that stays consistent across all frames. " +
-            "Example: 'a pixel-art goblin warrior with green skin and rusty armor'"
+          "Detailed character/object description. Be specific about colors, features, and " +
+            "distinguishing details for best consistency across frames. " +
+            "Example: 'a pixel-art goblin warrior with green skin, brown leather armor, and a wooden club'"
         ),
       animation: z
         .string()
@@ -692,19 +694,27 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       quality: z
         .enum(["low", "medium", "high"])
         .optional()
-        .describe("Quality tier for each frame generation. Defaults to high."),
+        .describe("Quality tier. Defaults to high."),
       background: z
         .enum(["transparent", "opaque"])
         .optional()
-        .describe("Background type for each frame. Defaults to transparent."),
+        .describe("Background type for frames. Defaults to transparent."),
       gif: z
         .boolean()
         .optional()
-        .describe("Also generate an animated GIF preview alongside the sprite sheet. Defaults to true."),
+        .describe("Also generate an animated GIF preview. Defaults to true."),
       gif_background: z
         .string()
         .optional()
-        .describe("Background color for the GIF preview as hex (e.g., '#2a2a2a'). Defaults to dark gray. Use 'transparent' for no background."),
+        .describe("Background color for the GIF as hex (e.g., '#2a2a2a'). Defaults to dark gray. Use 'transparent' for no background."),
+      per_frame_mode: z
+        .boolean()
+        .optional()
+        .describe(
+          "Use per-frame edit API instead of single-sheet generation. " +
+            "Produces more distinct poses but less character consistency. " +
+            "Default false (single-sheet mode recommended)."
+        ),
     },
     GENERATION_ANNOTATIONS,
     async (args, extra) => {
@@ -713,9 +723,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       const rows = Math.ceil(frameCount / columns);
       const animName = args.animation ?? "idle";
       const fps = args.fps ?? 12;
+      const usePerFrame = args.per_frame_mode === true;
 
       const wantGif = args.gif !== false; // default true
-      const totalSteps = frameCount + 2 + (wantGif ? 1 : 0); // frames + stitch + save + gif
+      const totalSteps = (usePerFrame ? frameCount : 4) + 2 + (wantGif ? 1 : 0);
 
       const sendProgress = async (step: string, progress: number, total: number) => {
         const progressToken = extra._meta?.progressToken;
@@ -728,36 +739,69 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       };
 
       try {
-        // Generate each frame individually
-        const frameBuffers = await generateFrames(
-          generator,
-          {
-            prompt: args.prompt,
-            animation: animName,
-            frameCount,
-            frameDescriptions: args.frame_descriptions,
-            quality: args.quality as QualityTier | undefined,
-            background: args.background as "transparent" | "opaque" | undefined,
-          },
-          (step, progress, _total) => {
-            sendProgress(step, progress, totalSteps);
-          }
-        );
+        let frameBuffers: Buffer[];
+        let frameWidth: number;
+        let frameHeight: number;
+        let apiCalls: number;
+        let mode: string;
 
-        // Stitch frames into grid
-        await sendProgress("Stitching frames into sprite sheet", frameCount + 1, totalSteps);
+        if (usePerFrame) {
+          // Per-frame edit mode (legacy, more distinct poses but less consistency)
+          mode = "per-frame edit";
+          apiCalls = frameCount;
+          const result = await generateFrames(
+            generator,
+            {
+              prompt: args.prompt,
+              animation: animName,
+              frameCount,
+              columns,
+              frameDescriptions: args.frame_descriptions,
+              quality: args.quality as QualityTier | undefined,
+              background: args.background as "transparent" | "opaque" | undefined,
+            },
+            (step, progress, _total) => {
+              sendProgress(step, progress, totalSteps);
+            }
+          );
+          frameBuffers = result;
+          frameWidth = 1024;
+          frameHeight = 1024;
+        } else {
+          // Single-sheet mode (default, best character consistency)
+          mode = "single-sheet";
+          apiCalls = 1;
+          const result = await generateSingleSheet(
+            generator,
+            {
+              prompt: args.prompt,
+              animation: animName,
+              frameCount,
+              columns,
+              frameDescriptions: args.frame_descriptions,
+              quality: args.quality as QualityTier | undefined,
+              background: args.background as "transparent" | "opaque" | undefined,
+            },
+            (step, progress, _total) => {
+              sendProgress(step, progress, totalSteps);
+            }
+          );
+          frameBuffers = result.frames;
+          frameWidth = result.frameWidth;
+          frameHeight = result.frameHeight;
+        }
 
-        // Each frame is 1024x1024 (game_sprite default), compute grid dimensions
-        const frameWidth = 1024;
-        const frameHeight = 1024;
+        // Stitch frames into clean grid
+        const stitchStep = usePerFrame ? frameCount + 1 : 5;
+        await sendProgress("Stitching frames into sprite sheet", stitchStep, totalSteps);
         const sheetBuffer = await stitchFrames(frameBuffers, columns, frameWidth, frameHeight);
 
-        // Save the final sprite sheet
-        await sendProgress("Saving sprite sheet and metadata", frameCount + 2, totalSteps);
+        // Save
+        const saveStep = stitchStep + 1;
+        await sendProgress("Saving sprite sheet and metadata", saveStep, totalSteps);
         const outputDir = process.env.ASSET_OUTPUT_DIR || "assets";
         const filePath = saveImage(sheetBuffer, "sprite_sheet", args.prompt, outputDir);
 
-        // Generate JSON metadata (same format as standard sprite sheet)
         const jsonPath = saveSpriteSheetMeta(filePath, {
           animation: animName,
           frameWidth,
@@ -774,7 +818,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         // Generate animated GIF preview
         let gifPath: string | null = null;
         if (wantGif) {
-          await sendProgress("Creating animated GIF preview", frameCount + 3, totalSteps);
+          await sendProgress("Creating animated GIF preview", saveStep + 1, totalSteps);
 
           let gifBg: { r: number; g: number; b: number } | null | undefined;
           if (args.gif_background === "transparent") {
@@ -796,7 +840,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         }
 
         const output = [
-          `Generated high-quality sprite sheet (per-frame rendering):`,
+          `Generated sprite sheet (${mode} mode):`,
           `  File: ${filePath}`,
           `  Dimensions: ${sheetWidth}x${sheetHeight}`,
           `  Frames: ${frameCount} (${columns}x${rows} grid)`,
@@ -808,10 +852,11 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           output.push(`  GIF preview: ${gifPath}`);
         }
         output.push(
-          `  API calls: ${frameCount} (one per frame)`,
+          `  API calls: ${apiCalls}`,
           ``,
-          `Each frame was generated individually with consistent character`,
-          `description and frame-specific pose directions.`,
+          mode === "single-sheet"
+            ? `All frames generated in a single image for maximum character consistency,\nthen split and centered into individual frames.`
+            : `Each frame generated individually via edit API for maximum pose variety.`,
         );
 
         return {

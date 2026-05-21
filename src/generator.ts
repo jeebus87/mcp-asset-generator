@@ -9,7 +9,7 @@ import {
   ASSET_TYPE_CONFIGS,
 } from "./types.js";
 import { enhancePrompt } from "./prompt.js";
-import { saveImage, removeBackground } from "./files.js";
+import { saveImage } from "./files.js";
 import { classifyApiError } from "./errors.js";
 
 type ApiSize = NonNullable<ImageGenerateParams["size"]>;
@@ -69,12 +69,18 @@ export class ImageGenerator {
     onProgress?.("Generating image via OpenAI", 2, 4);
     const size = pickClosestSize(width, height);
 
+    // gpt-image-1 supports native transparent backgrounds.
+    // gpt-image-2 does not. Use gpt-image-1 when transparency is needed.
+    const needsTransparency = background === "transparent";
+    const model = needsTransparency ? "gpt-image-1" : this.config.imageModel;
+
     const apiParams: ImageGenerateParams = {
-      model: this.config.imageModel,
+      model,
       prompt: enhanced,
       n: 1,
       size,
       quality,
+      ...(needsTransparency ? { background: "transparent" as const } : {}),
     };
 
     let response;
@@ -96,13 +102,7 @@ export class ImageGenerator {
         "No b64_json in API response. Ensure the model supports base64 output."
       );
     }
-    let buffer = Buffer.from(b64, "base64");
-
-    // Strip background to true alpha for asset types that need transparency.
-    // gpt-image-2 doesn't support the background param, so we post-process with sharp.
-    if (background === "transparent") {
-      buffer = Buffer.from(await removeBackground(buffer));
-    }
+    const buffer = Buffer.from(b64, "base64");
 
     // Parse actual dimensions from the size used
     const [actualWidth, actualHeight] = size === "auto"
@@ -139,19 +139,31 @@ export class ImageGenerator {
   async editImage(
     sourceBuffer: Buffer,
     prompt: string,
-    options?: { quality?: QualityTier; size?: "1024x1024" | "1536x1024" | "1024x1536" }
+    options?: {
+      quality?: QualityTier;
+      size?: "1024x1024" | "1536x1024" | "1024x1536";
+      mask?: Buffer;
+      background?: "transparent" | "opaque";
+    }
   ): Promise<Buffer> {
     const imageFile = new File([new Uint8Array(sourceBuffer)], "source.png", { type: "image/png" });
 
+    const editParams: Record<string, unknown> = {
+      model: "gpt-image-1",
+      image: imageFile,
+      prompt,
+      n: 1,
+      size: options?.size ?? "1024x1024",
+      background: options?.background ?? "transparent",
+    };
+
+    if (options?.mask) {
+      editParams.mask = new File([new Uint8Array(options.mask)], "mask.png", { type: "image/png" });
+    }
+
     let response;
     try {
-      response = await this.openai.images.edit({
-        model: this.config.imageModel,
-        image: imageFile,
-        prompt,
-        n: 1,
-        size: options?.size ?? "1024x1024",
-      });
+      response = await this.openai.images.edit(editParams as any);
     } catch (error) {
       throw classifyApiError(error, prompt);
     }

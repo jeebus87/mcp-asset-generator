@@ -1,9 +1,11 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   generateFramePrompts,
+  buildSheetPrompt,
   stitchFrames,
   generateFrames,
-  type PerFrameParams,
+  generateSingleSheet,
+  type SpriteSheetParams,
 } from "../sprite-frames.js";
 
 describe("generateFramePrompts", () => {
@@ -11,85 +13,85 @@ describe("generateFramePrompts", () => {
 
   describe("with preset animations", () => {
     it("generates correct number of prompts for walk animation", () => {
-      const prompts = generateFramePrompts(base, "walk", 8);
-      expect(prompts).toHaveLength(8);
+      const { generate, edits } = generateFramePrompts(base, "walk", 8);
+      expect(edits).toHaveLength(7); // 7 edit prompts + 1 generate = 8 total
     });
 
     it("generates correct number of prompts for idle animation", () => {
-      const prompts = generateFramePrompts(base, "idle", 4);
-      expect(prompts).toHaveLength(4);
+      const { generate, edits } = generateFramePrompts(base, "idle", 4);
+      expect(edits).toHaveLength(3);
     });
 
-    it("frame 1 starts with base description, frames 2+ are edit instructions", () => {
-      const prompts = generateFramePrompts(base, "walk", 8);
-      // Frame 1: generated from scratch, includes base description
-      expect(prompts[0]).toContain(base);
-      // Frames 2+: edit instructions, don't include base description
-      for (let i = 1; i < prompts.length; i++) {
-        expect(prompts[i]).toContain("Change the pose");
-        expect(prompts[i]).toContain("MUST be in a clearly different position");
+    it("generate prompt includes base description and style anchor", () => {
+      const { generate } = generateFramePrompts(base, "walk", 8);
+      expect(generate).toContain(base);
+      expect(generate).toContain("consistent lighting");
+      expect(generate).toContain("same character");
+    });
+
+    it("edit prompts use Change/Preserve format", () => {
+      const { edits } = generateFramePrompts(base, "walk", 8);
+      for (const prompt of edits) {
+        expect(prompt).toContain("Change:");
+        expect(prompt).toContain("Preserve:");
+        expect(prompt).toContain("Do not change");
       }
     });
 
-    it("frame 1 includes animation context", () => {
-      const prompts = generateFramePrompts(base, "run", 6);
-      expect(prompts[0]).toContain("run");
-      expect(prompts[0]).toContain(base);
+    it("edit prompts include base description in Preserve section", () => {
+      const { edits } = generateFramePrompts(base, "walk", 4);
+      for (const prompt of edits) {
+        expect(prompt).toContain(base);
+      }
     });
 
-    it("edit frames describe specific poses", () => {
-      const prompts = generateFramePrompts(base, "attack", 4);
-      for (let i = 1; i < 4; i++) {
-        expect(prompts[i]).toContain("Change the pose");
-      }
+    it("each edit has a distinct pose description", () => {
+      const { edits } = generateFramePrompts(base, "attack", 4);
+      const unique = new Set(edits);
+      expect(unique.size).toBe(3);
     });
 
     it("cycles preset poses when frameCount exceeds preset length", () => {
-      const prompts = generateFramePrompts(base, "idle", 12);
-      expect(prompts).toHaveLength(12);
-      // Frame 9 (index 8) should cycle back to preset index 0
-      // Both should contain the same pose description
-      expect(prompts[8]).toContain("standing still, neutral pose");
-      expect(prompts[0]).toContain("standing still, neutral pose");
+      const { generate, edits } = generateFramePrompts(base, "idle", 12);
+      expect(edits).toHaveLength(11);
+      expect(generate).toContain("standing still, neutral pose");
+      expect(edits[7]).toContain("standing still, neutral pose");
     });
 
     it("handles fewer frames than preset length", () => {
-      const prompts = generateFramePrompts(base, "walk", 3);
-      expect(prompts).toHaveLength(3);
+      const { generate, edits } = generateFramePrompts(base, "walk", 3);
+      expect(edits).toHaveLength(2);
     });
 
     it("is case-insensitive for animation names", () => {
       const lower = generateFramePrompts(base, "walk", 4);
       const upper = generateFramePrompts(base, "WALK", 4);
-      // Both should use the walk preset (same pose descriptions)
-      expect(lower[0]).toContain("walking");
-      expect(upper[0]).toContain("walking");
+      expect(lower.generate).toContain("walking");
+      expect(upper.generate).toContain("walking");
     });
   });
 
   describe("with custom frame descriptions", () => {
     it("uses custom descriptions when provided", () => {
       const custom = ["crouching low", "leaping up", "mid-air spin", "landing"];
-      const prompts = generateFramePrompts(base, "custom", 4, custom);
-      expect(prompts[0]).toBe(`${base}, crouching low`);
-      expect(prompts[1]).toBe(`${base}, leaping up`);
-      expect(prompts[2]).toBe(`${base}, mid-air spin`);
-      expect(prompts[3]).toBe(`${base}, landing`);
+      const { generate, edits } = generateFramePrompts(base, "custom", 4, custom);
+      expect(generate).toContain("crouching low");
+      expect(edits[0]).toContain("leaping up");
+      expect(edits[1]).toContain("mid-air spin");
+      expect(edits[2]).toContain("landing");
     });
 
     it("truncates custom descriptions to frameCount", () => {
       const custom = ["pose1", "pose2", "pose3", "pose4", "pose5"];
-      const prompts = generateFramePrompts(base, "custom", 3, custom);
-      expect(prompts).toHaveLength(3);
-      expect(prompts[2]).toBe(`${base}, pose3`);
+      const { generate, edits } = generateFramePrompts(base, "custom", 3, custom);
+      expect(edits).toHaveLength(2);
     });
 
     it("falls back to generic when custom descriptions are too few", () => {
       const custom = ["only-one"];
-      const prompts = generateFramePrompts(base, "dance", 4, custom);
-      // Not enough custom descriptions, falls through to generic
-      expect(prompts).toHaveLength(4);
-      for (const prompt of prompts) {
+      const { generate, edits } = generateFramePrompts(base, "dance", 4, custom);
+      expect(edits).toHaveLength(3);
+      for (const prompt of edits) {
         expect(prompt).toContain("dance");
       }
     });
@@ -97,48 +99,110 @@ describe("generateFramePrompts", () => {
 
   describe("with unknown animation (no preset, no custom)", () => {
     it("generates generic pose variations", () => {
-      const prompts = generateFramePrompts(base, "backflip", 4);
-      expect(prompts).toHaveLength(4);
-      // Frame 1: base description with animation name
-      expect(prompts[0]).toContain(base);
-      expect(prompts[0]).toContain("backflip");
-      // Frames 2+: edit instructions
-      for (let i = 1; i < 4; i++) {
-        expect(prompts[i]).toContain("Change the pose");
-        expect(prompts[i]).toContain("backflip");
+      const { generate, edits } = generateFramePrompts(base, "backflip", 4);
+      expect(edits).toHaveLength(3);
+      expect(generate).toContain(base);
+      expect(generate).toContain("backflip");
+      for (const prompt of edits) {
+        expect(prompt).toContain("backflip");
+      }
+    });
+  });
+
+  describe("edit prompt structure", () => {
+    it("does not include 'sprite sheet' language in edit prompts", () => {
+      const { edits } = generateFramePrompts(base, "walk", 8);
+      for (const prompt of edits) {
+        expect(prompt).not.toContain("sprite sheet");
+      }
+    });
+
+    it("does not include 'frame X of Y' in edit prompts", () => {
+      const { edits } = generateFramePrompts(base, "walk", 8);
+      for (const prompt of edits) {
+        expect(prompt).not.toMatch(/frame \d+ of \d+/);
+      }
+    });
+
+    it("includes preservation constraints in every edit", () => {
+      const { edits } = generateFramePrompts(base, "run", 6);
+      for (const prompt of edits) {
+        expect(prompt).toContain("Do not change the character's face");
+        expect(prompt).toContain("consistent lighting");
       }
     });
   });
 
   describe("edge cases", () => {
     it("handles frameCount of 2 (minimum)", () => {
-      const prompts = generateFramePrompts(base, "idle", 2);
-      expect(prompts).toHaveLength(2);
+      const { generate, edits } = generateFramePrompts(base, "idle", 2);
+      expect(edits).toHaveLength(1);
     });
 
     it("handles frameCount of 16 (maximum)", () => {
-      const prompts = generateFramePrompts(base, "walk", 16);
-      expect(prompts).toHaveLength(16);
+      const { generate, edits } = generateFramePrompts(base, "walk", 16);
+      expect(edits).toHaveLength(15);
     });
 
-    it("all prompts are unique strings", () => {
-      const prompts = generateFramePrompts(base, "walk", 8);
-      const unique = new Set(prompts);
-      expect(unique.size).toBe(8);
+    it("all edit prompts are unique strings", () => {
+      const { edits } = generateFramePrompts(base, "walk", 8);
+      const unique = new Set(edits);
+      expect(unique.size).toBe(7);
     });
 
     it("empty base description still produces valid prompts", () => {
-      const prompts = generateFramePrompts("", "idle", 4);
-      expect(prompts).toHaveLength(4);
-      for (const p of prompts) {
+      const { generate, edits } = generateFramePrompts("", "idle", 4);
+      expect(generate.length).toBeGreaterThan(0);
+      for (const p of edits) {
         expect(p.length).toBeGreaterThan(0);
       }
     });
   });
 });
 
+describe("buildSheetPrompt", () => {
+  const base = "a pixel-art goblin with green skin";
+
+  it("includes character description and animation type", () => {
+    const prompt = buildSheetPrompt(base, "walk", 8, 4);
+    expect(prompt).toContain(base);
+    expect(prompt).toContain("walk");
+  });
+
+  it("specifies grid layout", () => {
+    const prompt = buildSheetPrompt(base, "walk", 8, 4);
+    expect(prompt).toContain("4x2 grid");
+    expect(prompt).toContain("8 frames");
+  });
+
+  it("uses horizontal row for single-row layouts", () => {
+    const prompt = buildSheetPrompt(base, "walk", 4, 4);
+    expect(prompt).toContain("single horizontal row");
+  });
+
+  it("includes per-frame pose descriptions", () => {
+    const prompt = buildSheetPrompt(base, "walk", 4, 4);
+    expect(prompt).toContain("Frame 1:");
+    expect(prompt).toContain("Frame 4:");
+    expect(prompt).toContain("walking");
+  });
+
+  it("includes consistency instructions", () => {
+    const prompt = buildSheetPrompt(base, "idle", 4, 4);
+    expect(prompt).toContain("identical proportions");
+    expect(prompt).toContain("identical colors");
+    expect(prompt).toContain("identical art style");
+  });
+
+  it("uses custom descriptions when provided", () => {
+    const custom = ["crouching", "jumping", "landing", "standing"];
+    const prompt = buildSheetPrompt(base, "custom", 4, 4, custom);
+    expect(prompt).toContain("crouching");
+    expect(prompt).toContain("landing");
+  });
+});
+
 describe("stitchFrames", () => {
-  // Create small solid-color PNG buffers for testing
   async function makeColorBuffer(
     r: number, g: number, b: number,
     width = 64, height = 64
@@ -162,8 +226,8 @@ describe("stitchFrames", () => {
     expect(result).toBeInstanceOf(Buffer);
 
     const meta = await sharp(result).metadata();
-    expect(meta.width).toBe(128);  // 2 columns * 64
-    expect(meta.height).toBe(128); // 2 rows * 64
+    expect(meta.width).toBe(128);
+    expect(meta.height).toBe(128);
     expect(meta.format).toBe("png");
   });
 
@@ -175,8 +239,8 @@ describe("stitchFrames", () => {
 
     const result = await stitchFrames(frames, 4, 64, 64);
     const meta = await sharp(result).metadata();
-    expect(meta.width).toBe(256);  // 4 * 64
-    expect(meta.height).toBe(128); // 2 * 64
+    expect(meta.width).toBe(256);
+    expect(meta.height).toBe(128);
   });
 
   it("handles non-square frames", async () => {
@@ -189,8 +253,8 @@ describe("stitchFrames", () => {
 
     const result = await stitchFrames(frames, 3, 128, 64);
     const meta = await sharp(result).metadata();
-    expect(meta.width).toBe(384);  // 3 * 128
-    expect(meta.height).toBe(64);  // 1 row * 64
+    expect(meta.width).toBe(384);
+    expect(meta.height).toBe(64);
   });
 
   it("handles fewer frames than columns (partial last row)", async () => {
@@ -201,11 +265,10 @@ describe("stitchFrames", () => {
       makeColorBuffer(0, 0, 255),
     ]);
 
-    // 3 frames, 4 columns = 1 row with empty last cell
     const result = await stitchFrames(frames, 4, 64, 64);
     const meta = await sharp(result).metadata();
-    expect(meta.width).toBe(256);  // 4 * 64
-    expect(meta.height).toBe(64);  // ceil(3/4) = 1 row
+    expect(meta.width).toBe(256);
+    expect(meta.height).toBe(64);
   });
 
   it("produces a valid PNG with alpha channel", async () => {
@@ -217,12 +280,11 @@ describe("stitchFrames", () => {
 
     const result = await stitchFrames(frames, 2, 64, 64);
     const meta = await sharp(result).metadata();
-    expect(meta.channels).toBe(4); // RGBA
+    expect(meta.channels).toBe(4);
   });
 
   it("resizes frames that don't match target dimensions", async () => {
     const { default: sharp } = await import("sharp");
-    // Create 32x32 frames but stitch at 64x64 target
     const frames = await Promise.all([
       makeColorBuffer(255, 0, 0, 32, 32),
       makeColorBuffer(0, 255, 0, 32, 32),
@@ -230,13 +292,13 @@ describe("stitchFrames", () => {
 
     const result = await stitchFrames(frames, 2, 64, 64);
     const meta = await sharp(result).metadata();
-    expect(meta.width).toBe(128); // 2 * 64
-    expect(meta.height).toBe(64); // 1 * 64
+    expect(meta.width).toBe(128);
+    expect(meta.height).toBe(64);
   });
 });
 
-describe("generateFrames", () => {
-  it("calls generate once for frame 1, then editImage for remaining frames", async () => {
+describe("generateFrames (per-frame edit mode)", () => {
+  it("calls generate once and edit for remaining frames", async () => {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const os = await import("node:os");
@@ -248,103 +310,90 @@ describe("generateFrames", () => {
       create: { width: 16, height: 16, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 255 } },
     }).png().toBuffer();
 
-    const editPng = await sharp({
-      create: { width: 16, height: 16, channels: 4, background: { r: 0, g: 255, b: 0, alpha: 255 } },
-    }).png().toBuffer();
-
     const mockGenerator = {
       generate: vi.fn(async (params: any) => {
-        const filePath = path.join(tmpDir, `frame-1.png`);
+        const filePath = path.join(tmpDir, `frame.png`);
         fs.writeFileSync(filePath, fakePng);
         return {
-          filePath,
-          width: 1024,
-          height: 1024,
-          model: "gpt-image-2",
-          quality: "high",
-          enhancedPrompt: params.prompt,
-          originalPrompt: params.prompt,
-          type: "game_sprite",
+          filePath, width: 1024, height: 1024, model: "gpt-image-1",
+          quality: "high", enhancedPrompt: params.prompt,
+          originalPrompt: params.prompt, type: "game_sprite",
           generationParams: {},
         };
       }),
-      editImage: vi.fn(async () => editPng),
+      editImage: vi.fn(async () => fakePng),
     } as any;
 
     const progressCalls: [string, number, number][] = [];
 
     const buffers = await generateFrames(
       mockGenerator,
-      {
-        prompt: "a test goblin",
-        animation: "idle",
-        frameCount: 3,
-      },
-      (step, progress, total) => {
-        progressCalls.push([step, progress, total]);
-      }
+      { prompt: "a test goblin", animation: "idle", frameCount: 3, columns: 4 },
+      (step, progress, total) => { progressCalls.push([step, progress, total]); }
     );
 
-    // Frame 1: generate from scratch
     expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
-    // Frames 2-3: edit from frame 1
     expect(mockGenerator.editImage).toHaveBeenCalledTimes(2);
-
-    // Should return 3 buffers
     expect(buffers).toHaveLength(3);
     for (const buf of buffers) {
       expect(buf).toBeInstanceOf(Buffer);
       expect(buf.length).toBeGreaterThan(0);
     }
 
-    // Progress: 1 for base frame + 2 for edits = 3
+    // No mask by default
+    for (const call of mockGenerator.editImage.mock.calls) {
+      const opts = call[2];
+      expect(opts.mask).toBeUndefined();
+    }
+
     expect(progressCalls).toHaveLength(3);
     expect(progressCalls[0][0]).toContain("base frame");
-    expect(progressCalls[1][0]).toContain("frame 2/3");
     expect(progressCalls[2][0]).toContain("frame 3/3");
 
-    // Temp frame file for frame 1 should have been cleaned up
     const remaining = fs.readdirSync(tmpDir);
     expect(remaining).toHaveLength(0);
-
     fs.rmdirSync(tmpDir);
   });
 
-  it("editImage receives the base frame buffer as source", async () => {
+  it("edit prompts use Change/Preserve format", async () => {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const os = await import("node:os");
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-test2-"));
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-prompt-"));
 
     const { default: sharp } = await import("sharp");
-    const basePng = await sharp({
-      create: { width: 16, height: 16, channels: 4, background: { r: 100, g: 100, b: 100, alpha: 255 } },
+    const fakePng = await sharp({
+      create: { width: 16, height: 16, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 255 } },
     }).png().toBuffer();
 
     const mockGenerator = {
-      generate: vi.fn(async () => {
-        const filePath = path.join(tmpDir, `base.png`);
-        fs.writeFileSync(filePath, basePng);
-        return { filePath, width: 1024, height: 1024, model: "gpt-image-2",
-          quality: "high", enhancedPrompt: "", originalPrompt: "",
-          type: "game_sprite", generationParams: {} };
+      generate: vi.fn(async (params: any) => {
+        const filePath = path.join(tmpDir, `frame.png`);
+        fs.writeFileSync(filePath, fakePng);
+        return {
+          filePath, width: 1024, height: 1024, model: "gpt-image-1",
+          quality: "high", enhancedPrompt: params.prompt,
+          originalPrompt: params.prompt, type: "game_sprite",
+          generationParams: {},
+        };
       }),
-      editImage: vi.fn(async (sourceBuffer: Buffer) => {
-        // Verify the source buffer is the base frame
-        expect(sourceBuffer).toEqual(basePng);
-        return basePng;
-      }),
+      editImage: vi.fn(async () => fakePng),
     } as any;
 
-    await generateFrames(mockGenerator, {
-      prompt: "test",
-      animation: "walk",
-      frameCount: 2,
-    });
+    await generateFrames(
+      mockGenerator,
+      { prompt: "a knight in silver armor", animation: "walk", frameCount: 3, columns: 4 },
+    );
 
-    expect(mockGenerator.editImage).toHaveBeenCalledTimes(1);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    for (const call of mockGenerator.editImage.mock.calls) {
+      const prompt = call[1];
+      expect(prompt).toContain("Change:");
+      expect(prompt).toContain("Preserve:");
+      expect(prompt).toContain("Do not change");
+    }
+
+    fs.rmSync(tmpDir, { recursive: true });
   });
 
   it("propagates generator errors on frame 1", async () => {
@@ -357,50 +406,118 @@ describe("generateFrames", () => {
 
     await expect(
       generateFrames(mockGenerator, {
-        prompt: "a test sprite",
-        animation: "walk",
-        frameCount: 4,
+        prompt: "a test sprite", animation: "walk", frameCount: 4, columns: 4,
       })
     ).rejects.toThrow("API rate limit exceeded");
 
     expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
     expect(mockGenerator.editImage).not.toHaveBeenCalled();
   });
+});
 
-  it("propagates editImage errors on subsequent frames", async () => {
+describe("generateSingleSheet", () => {
+  it("generates one image and splits into frames", async () => {
     const fs = await import("node:fs");
     const path = await import("node:path");
     const os = await import("node:os");
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sprite-test3-"));
-
     const { default: sharp } = await import("sharp");
-    const fakePng = await sharp({
-      create: { width: 16, height: 16, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 255 } },
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sheet-test-"));
+
+    // Create a fake 1536x1024 image (simulating a 4x2 grid of 384x512 cells)
+    const fakeSheet = await sharp({
+      create: { width: 1536, height: 1024, channels: 4, background: { r: 100, g: 200, b: 50, alpha: 255 } },
     }).png().toBuffer();
 
     const mockGenerator = {
-      generate: vi.fn(async () => {
-        const filePath = path.join(tmpDir, `base.png`);
-        fs.writeFileSync(filePath, fakePng);
-        return { filePath, width: 1024, height: 1024, model: "gpt-image-2",
-          quality: "high", enhancedPrompt: "", originalPrompt: "",
-          type: "game_sprite", generationParams: {} };
+      generate: vi.fn(async (params: any) => {
+        const filePath = path.join(tmpDir, `sheet.png`);
+        fs.writeFileSync(filePath, fakeSheet);
+        return {
+          filePath, width: 1536, height: 1024, model: "gpt-image-1",
+          quality: "high", enhancedPrompt: params.prompt,
+          originalPrompt: params.prompt, type: "sprite_sheet",
+          generationParams: {},
+        };
       }),
-      editImage: vi.fn(async () => {
-        throw new Error("Edit API failed");
+    } as any;
+
+    const progressCalls: [string, number, number][] = [];
+
+    const result = await generateSingleSheet(
+      mockGenerator,
+      { prompt: "a goblin", animation: "walk", frameCount: 8, columns: 4 },
+      (step, progress, total) => { progressCalls.push([step, progress, total]); }
+    );
+
+    // Should produce 8 frames from one API call
+    expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
+    expect(result.frames).toHaveLength(8);
+    expect(result.frameWidth).toBeGreaterThan(0);
+    expect(result.frameHeight).toBeGreaterThan(0);
+
+    for (const frame of result.frames) {
+      expect(frame).toBeInstanceOf(Buffer);
+      expect(frame.length).toBeGreaterThan(0);
+    }
+
+    // Should report progress
+    expect(progressCalls.length).toBeGreaterThanOrEqual(3);
+    expect(progressCalls[0][0]).toContain("Generating sprite sheet");
+    expect(progressCalls[1][0]).toContain("Splitting");
+
+    fs.rmSync(tmpDir, { recursive: true });
+  });
+
+  it("generate prompt includes all frame descriptions", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const os = await import("node:os");
+    const { default: sharp } = await import("sharp");
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sheet-prompt-"));
+
+    const fakeSheet = await sharp({
+      create: { width: 1024, height: 1024, channels: 4, background: { r: 100, g: 200, b: 50, alpha: 255 } },
+    }).png().toBuffer();
+
+    const mockGenerator = {
+      generate: vi.fn(async (params: any) => {
+        const filePath = path.join(tmpDir, `sheet.png`);
+        fs.writeFileSync(filePath, fakeSheet);
+        return {
+          filePath, width: 1024, height: 1024, model: "gpt-image-1",
+          quality: "high", enhancedPrompt: params.prompt,
+          originalPrompt: params.prompt, type: "sprite_sheet",
+          generationParams: {},
+        };
+      }),
+    } as any;
+
+    await generateSingleSheet(
+      mockGenerator,
+      { prompt: "a goblin warrior", animation: "walk", frameCount: 4, columns: 4 },
+    );
+
+    const prompt = mockGenerator.generate.mock.calls[0][0].prompt;
+    expect(prompt).toContain("a goblin warrior");
+    expect(prompt).toContain("walk");
+    expect(prompt).toContain("Frame 1:");
+    expect(prompt).toContain("Frame 4:");
+    expect(prompt).toContain("identical proportions");
+  });
+
+  it("propagates errors from the generator", async () => {
+    const mockGenerator = {
+      generate: vi.fn(async () => {
+        throw new Error("quota exceeded");
       }),
     } as any;
 
     await expect(
-      generateFrames(mockGenerator, {
-        prompt: "a test sprite",
-        animation: "walk",
-        frameCount: 3,
+      generateSingleSheet(mockGenerator, {
+        prompt: "test", animation: "idle", frameCount: 4, columns: 4,
       })
-    ).rejects.toThrow("Edit API failed");
-
-    expect(mockGenerator.generate).toHaveBeenCalledTimes(1);
-    expect(mockGenerator.editImage).toHaveBeenCalledTimes(1);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    ).rejects.toThrow("quota exceeded");
   });
 });
