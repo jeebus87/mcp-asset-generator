@@ -442,16 +442,17 @@ export async function normalizeFrames(
  * For 7+ frames, generates in batches of 6 (max per strip).
  */
 /**
- * Hybrid sprite pipeline: single-sheet generation + contour-based extraction.
+ * Hybrid sprite pipeline: single-sheet generation + per-cell contour cleanup
+ * + bottom-center normalization.
  *
- * One API call generates all frames in a single image (best consistency --
- * the model sees everything at once in the same context). Frames are then
- * extracted by finding character blobs via connected component analysis,
- * not by splitting on grid lines. This makes frame bleed irrelevant.
- * Finally, frames are normalized to uniform size with bottom-center anchoring.
- *
- * This combines the consistency of single-sheet with the bleed immunity
- * of contour extraction.
+ * 1. One API call generates all frames in a single image (best consistency --
+ *    the model sees everything at once in the same context).
+ * 2. Grid-split into cells (we know the layout).
+ * 3. Within each cell, use dilation + connected component analysis to find
+ *    the character blob and remove bleed fragments from adjacent cells.
+ *    (Dilation is safe per-cell because there's only one character per cell.)
+ * 4. Normalize all frames to uniform size with bottom-center anchoring
+ *    (feet on a consistent ground line).
  */
 export async function generateHybridSheet(
   generator: ImageGenerator,
@@ -466,7 +467,7 @@ export async function generateHybridSheet(
   const genGrid = pickGenerationGrid(params.frameCount);
   const size = pickSheetSize(genGrid.cols, genGrid.rows);
   const [imgWidth, imgHeight] = size.split("x").map(Number);
-  const totalSteps = 4;
+  const totalSteps = 5;
 
   // Step 1: Generate all frames in a single API call
   onProgress?.("Generating sprite sheet (single image)", 1, totalSteps);
@@ -493,20 +494,67 @@ export async function generateHybridSheet(
   const sheetBuffer = fs.readFileSync(result.filePath);
   try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
 
-  // Step 2: Extract frames by contour (not grid lines)
-  onProgress?.("Extracting frames by contour detection", 2, totalSteps);
-  const { frames: rawFrames } = await extractFramesByContour(
-    sheetBuffer,
-    params.frameCount
-  );
+  // Step 2: Grid-split into cells
+  onProgress?.("Splitting into cells", 2, totalSteps);
+  const cellWidth = Math.floor(imgWidth / genGrid.cols);
+  const cellHeight = Math.floor(imgHeight / genGrid.rows);
+  const rawFrames: Buffer[] = [];
 
-  // Step 3: Normalize all frames (bottom-center anchor, uniform size)
-  onProgress?.("Normalizing frames", 3, totalSteps);
+  for (let row = 0; row < genGrid.rows; row++) {
+    for (let col = 0; col < genGrid.cols; col++) {
+      const frameIndex = row * genGrid.cols + col;
+      if (frameIndex >= params.frameCount) break;
+
+      const frame = await sharp(sheetBuffer)
+        .extract({
+          left: col * cellWidth,
+          top: row * cellHeight,
+          width: cellWidth,
+          height: cellHeight,
+        })
+        .png()
+        .toBuffer();
+      rawFrames.push(frame);
+    }
+  }
+
+  // Step 3: Per-cell cleanup -- remove bleed fragments within each cell
+  onProgress?.("Cleaning up frame bleed", 3, totalSteps);
+  const cleanedFrames: Buffer[] = [];
+
+  for (const frame of rawFrames) {
+    const meta = await sharp(frame).metadata();
+    const w = meta.width!;
+    const h = meta.height!;
+
+    const raw = await sharp(frame)
+      .ensureAlpha()
+      .raw()
+      .toBuffer();
+
+    const pixels = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+
+    // Clean alpha
+    cleanAlpha(pixels, w, h, "soft");
+
+    // Remove bleed fragments -- safe per-cell because only one character
+    // exists per cell, so dilation won't merge across frames
+    removeFragments(pixels, w, h, 0.05);
+
+    const cleaned = await sharp(Buffer.from(pixels), {
+      raw: { width: w, height: h, channels: 4 },
+    }).png().toBuffer();
+
+    cleanedFrames.push(cleaned);
+  }
+
+  // Step 4: Normalize (bottom-center anchor, uniform size)
+  onProgress?.("Normalizing frames", 4, totalSteps);
   const targetSize = 512;
-  const normalizedFrames = await normalizeFrames(rawFrames, targetSize, "soft");
+  const normalizedFrames = await normalizeFrames(cleanedFrames, targetSize, "soft");
 
-  // Step 4: Quality gate
-  onProgress?.("Running quality checks", 4, totalSteps);
+  // Step 5: Quality gate
+  onProgress?.("Running quality checks", 5, totalSteps);
   const quality = await runQualityChecks(normalizedFrames, params.frameCount, targetSize);
 
   onProgress?.("Frames ready", totalSteps, totalSteps);
