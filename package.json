@@ -1,6 +1,6 @@
 {
   "name": "mcp-asset-generator",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "MCP server for generating app development assets with full art direction via OpenAI image generation",
   "type": "module",
   "main": "dist/index.js",
@@ -30,18 +30,17 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/mcp-asset-generator"
+    "url": "https://github.com/jeebus87/mcp-asset-generator.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "gifenc": "^1.0.3",
-    "openai": "^4.86.0",
+    "openai": "^6.38.0",
     "sharp": "^0.34.5",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/sharp": "^0.31.1",
     "dotenv": "^17.4.2",
     "tsx": "^4.22.3",
     "typescript": "^5.8.0",

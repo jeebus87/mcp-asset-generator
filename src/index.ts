@@ -20,7 +20,7 @@ async function main() {
   // Create MCP server
   const server = new McpServer({
     name: "mcp-asset-generator",
-    version: "1.0.0",
+    version: "0.1.0",
   });
 
   // Register tools
