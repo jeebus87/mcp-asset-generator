@@ -165,13 +165,28 @@ export class ImageGenerator {
       background?: "transparent" | "opaque";
       inputFidelity?: "low" | "high";
       model?: string;
+      /** Additional reference images. Passed as Image 1 (highest fidelity).
+       *  The sourceBuffer becomes Image 2+. The first image in the array
+       *  gets the richest texture preservation -- use for character reference. */
+      referenceImages?: Buffer[];
     }
   ): Promise<Buffer> {
-    const imageFile = new File([new Uint8Array(sourceBuffer)], "source.png", { type: "image/png" });
+    const sourceFile = new File([new Uint8Array(sourceBuffer)], "source.png", { type: "image/png" });
+
+    // Build image array: reference images first (highest fidelity), then source
+    let imageInput: File | File[];
+    if (options?.referenceImages && options.referenceImages.length > 0) {
+      const refFiles = options.referenceImages.map(
+        (buf, i) => new File([new Uint8Array(buf)], `ref-${i}.png`, { type: "image/png" })
+      );
+      imageInput = [...refFiles, sourceFile];
+    } else {
+      imageInput = sourceFile;
+    }
 
     const editParams: Record<string, unknown> = {
       model: options?.model ?? "gpt-image-1",
-      image: imageFile,
+      image: imageInput,
       prompt,
       n: 1,
       size: options?.size ?? "1024x1024",

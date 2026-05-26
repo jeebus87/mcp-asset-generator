@@ -497,17 +497,28 @@ export async function generateHybridSheet(
     const { canvas } = await buildEditCanvas(seedBuffer, stripColumns);
     const mask = await buildStripMask(stripColumns);
 
-    // Build the edit prompt
+    // Build the edit prompt -- repeat the full character description to anchor
+    // consistency. Research shows describing the full desired output (not just
+    // the change) produces much better results with the edit API.
     const poseList = batchPoses
       .map((pose, i) => `Frame ${i + 1}: ${pose}`)
       .join(". ");
 
+    // Prompt uses explicit image role labels -- Image 1 is the character
+    // reference (passed via referenceImages for highest fidelity), Image 2
+    // is the strip canvas to fill.
     const editPrompt =
-      `A horizontal strip of ${batchFrameCount} animation frames to the right of the reference character. ` +
-      `Each frame must show the EXACT SAME character as the reference (leftmost) -- identical proportions, ` +
-      `colors, art style, outfit, and features. Only the pose changes. ` +
+      `Image 1 is the character reference. This is the character's canonical design -- do not redesign it. ` +
+      `Image 2 is the animation strip canvas. Generate ${batchFrameCount} animation frames in Image 2, ` +
+      `to the right of the reference position. ` +
+      `CRITICAL: Every frame must show the EXACT character from Image 1 -- ` +
+      `same body shape, same proportions, same colors, same art style, ` +
+      `same size, same outline thickness, same level of detail. ` +
+      `The character is: ${params.prompt}. ` +
+      `The ONLY difference between frames is the pose. ` +
       `${poseList}. ` +
-      `Each frame is separated by clear empty space. The character is centered within each frame position.`;
+      `Keep each frame separated by empty space. Center the character in each position. ` +
+      `Do not change the character's design, color palette, or art style in any frame.`;
 
     let stripResult: Buffer;
     try {
@@ -521,6 +532,7 @@ export async function generateHybridSheet(
           background: params.background ?? "transparent",
           inputFidelity: "high",
           model: "gpt-image-1",
+          referenceImages: [seedBuffer],
         }
       );
     } catch (error) {
@@ -1517,7 +1529,7 @@ export async function generateFrames(
     const editedBuffer = await generator.editImage(
       sourceBuffer,
       editPrompts[i],
-      { quality: params.quality, size: editSize, mask: maskBuffer, background: params.background }
+      { quality: params.quality, size: editSize, mask: maskBuffer, background: params.background, inputFidelity: "high" }
     );
     buffers.push(editedBuffer);
   }
