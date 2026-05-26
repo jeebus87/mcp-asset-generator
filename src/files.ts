@@ -17,7 +17,6 @@ const TYPE_FOLDERS: Record<AssetType, string> = {
   game_background: "game/backgrounds",
   game_ui: "game/ui",
   print_newsletter: "newsletters",
-  sprite_sheet: "game/sprite-sheets",
   general: "general",
 };
 
@@ -56,67 +55,6 @@ export function saveImage(
 
   fs.writeFileSync(filePath, buffer);
   return filePath;
-}
-
-export interface SpriteSheetMeta {
-  animation: string;
-  frameWidth: number;
-  frameHeight: number;
-  columns: number;
-  rows: number;
-  frameCount: number;
-  fps: number;
-}
-
-export function saveSpriteSheetMeta(
-  imagePath: string,
-  meta: SpriteSheetMeta
-): string {
-  const jsonPath = imagePath.replace(/\.png$/, ".json");
-
-  const frames: Record<string, unknown> = {};
-  for (let i = 0; i < meta.frameCount; i++) {
-    const col = i % meta.columns;
-    const row = Math.floor(i / meta.columns);
-    frames[`${meta.animation}_${i}`] = {
-      frame: {
-        x: col * meta.frameWidth,
-        y: row * meta.frameHeight,
-        w: meta.frameWidth,
-        h: meta.frameHeight,
-      },
-      rotated: false,
-      trimmed: false,
-      spriteSourceSize: {
-        x: 0,
-        y: 0,
-        w: meta.frameWidth,
-        h: meta.frameHeight,
-      },
-      sourceSize: { w: meta.frameWidth, h: meta.frameHeight },
-    };
-  }
-
-  const output = {
-    frames,
-    meta: {
-      app: "mcp-asset-generator",
-      version: "1.0",
-      image: path.basename(imagePath),
-      format: "RGBA8888",
-      size: {
-        w: meta.columns * meta.frameWidth,
-        h: meta.rows * meta.frameHeight,
-      },
-      scale: 1,
-    },
-    animations: {
-      [meta.animation]: Array.from({ length: meta.frameCount }, (_, i) => i),
-    },
-  };
-
-  fs.writeFileSync(jsonPath, JSON.stringify(output, null, 2));
-  return jsonPath;
 }
 
 /**

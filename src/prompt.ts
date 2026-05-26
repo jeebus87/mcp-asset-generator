@@ -51,7 +51,6 @@ export function inferAssetType(prompt: string): AssetType {
     ["game_character", /\bgame\s*character\b|\bcharacter\s*(art|design|concept|portrait)\b|\bplayer\s*character\b|\bnpc\b|\benemy\s*(design|art|concept)\b|\bboss\s*(design|art)\b/],
     ["game_background", /\bgame\s*background\b|\blevel\s*background\b|\bgame\s*scene\b|\bgame\s*environment\b|\bparallax\b|\btileset\b/],
     ["game_ui", /\bgame\s*ui\b|\bgame\s*(button|frame|panel|menu|hud|health\s*bar|interface)\b/],
-    ["sprite_sheet", /\bsprite\s*sheet\b|\banimation\s*sheet\b|\bwalk\s*cycle\b|\bidle\s*animation\b|\battack\s*animation\b|\bframe\s*sheet\b/],
     ["print_newsletter", /\bprint(ed)?\s*newsletter\b|\bmail(ed)?\s*newsletter\b|\bphysical\s*newsletter\b|\bprint\s*flyer\b/],
     ["icon", /\bicon\b|\bapp\s*icon\b/],
     ["og_image", /\bog\s*image\b|\bopen\s*graph\b|\bsocial\s*(media\s*)?(\w+\s+)?image\b|\bsocial\s*card\b|\bshare\s*image\b/],

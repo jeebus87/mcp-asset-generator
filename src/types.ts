@@ -12,7 +12,6 @@ export type AssetType =
   | "game_background"
   | "game_ui"
   | "print_newsletter"
-  | "sprite_sheet"
   | "general";
 
 export type QualityTier = "low" | "medium" | "high";
@@ -151,14 +150,6 @@ export const ASSET_TYPE_CONFIGS: Record<AssetType, AssetTypeConfig> = {
     defaultQuality: "high",
     artDirection:
       "abstract background design for a printed page, NO TEXT NO WORDS NO LETTERS NO TYPOGRAPHY ANYWHERE, purely visual elements only, subtle patterns and gradients, branded color accents, professional atmosphere, large open dark areas suitable for text overlay, 8.5x11 portrait proportions",
-  },
-  sprite_sheet: {
-    defaultWidth: 1024,
-    defaultHeight: 1024,
-    defaultBackground: "transparent",
-    defaultQuality: "high",
-    artDirection:
-      "sprite sheet grid layout, multiple animation frames of the same character or object arranged in evenly spaced rows and columns on a single image, consistent art style across all frames, each frame shows a different pose or phase of motion, uniform frame size, clean separation between frames, game-ready 2D art, transparent background between frames",
   },
   general: {
     defaultWidth: 1024,
