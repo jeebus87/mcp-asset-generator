@@ -183,7 +183,10 @@ async function createGridTemplate(
 
 /**
  * Create a mask that exposes only a single cell for editing.
- * The target cell is transparent (editable), everything else is opaque.
+ * The target cell interior is transparent (alpha=0, editable),
+ * everything else is opaque (alpha=255, preserved).
+ * Built with raw pixels because SVG can't punch transparent holes
+ * through an opaque layer.
  */
 async function createSingleCellMask(
   width: number,
@@ -197,21 +200,31 @@ async function createSingleCellMask(
   const cellHeight = Math.floor(height / rows);
   const inset = BORDER_THICKNESS + MARK_SIZE + 2;
 
-  const x = targetCol * cellWidth + inset;
-  const y = targetRow * cellHeight + inset;
-  const w = cellWidth - inset * 2;
-  const h = cellHeight - inset * 2;
+  // Start fully opaque (RGBA all 0,0,0,255)
+  const pixels = new Uint8Array(width * height * 4);
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = 0;     // R
+    pixels[i + 1] = 0; // G
+    pixels[i + 2] = 0; // B
+    pixels[i + 3] = 255; // A = opaque (preserved)
+  }
 
-  const svg =
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
-    `<rect width="${width}" height="${height}" fill="black"/>` +
-    `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="black" fill-opacity="0"/>` +
-    `</svg>`;
+  // Punch a transparent hole for the target cell interior
+  const startX = targetCol * cellWidth + inset;
+  const startY = targetRow * cellHeight + inset;
+  const endX = (targetCol + 1) * cellWidth - inset;
+  const endY = (targetRow + 1) * cellHeight - inset;
 
-  return sharp(Buffer.from(svg))
-    .resize(width, height)
-    .png()
-    .toBuffer();
+  for (let y = startY; y < endY && y < height; y++) {
+    for (let x = startX; x < endX && x < width; x++) {
+      const i = (y * width + x) * 4;
+      pixels[i + 3] = 0; // A = transparent (editable)
+    }
+  }
+
+  return sharp(Buffer.from(pixels), {
+    raw: { width, height, channels: 4 },
+  }).png().toBuffer();
 }
 
 /**
@@ -859,8 +872,7 @@ export async function generateSingleSheet(
   const genGrid = pickGenerationGrid(params.frameCount);
   const size = pickSheetSize(genGrid.cols, genGrid.rows);
   const [imgWidth, imgHeight] = size.split("x").map(Number);
-  // Steps: 1 template + N frames + 1 post-process + 1 quality + 1 done
-  const totalSteps = 1 + params.frameCount + 3;
+  const totalSteps = 6;
 
   // Step 1: Create grid template
   onProgress?.("Creating grid template", 1, totalSteps);
@@ -871,15 +883,35 @@ export async function generateSingleSheet(
     genGrid.rows
   );
 
-  // Step 2-3: Generate each frame individually via per-cell edit API.
-  // Each cell gets its own API call with a mask exposing only that cell.
-  // Content physically cannot bleed into adjacent cells because they are
-  // opaque (preserved) in the mask.
-  const poses = resolveFramePoses(
+  // Step 2: Generate full sprite sheet in one API call.
+  // Single-sheet gives best character consistency since the AI draws all
+  // frames in one context. Bleed is handled by post-processing.
+  onProgress?.("Generating sprite sheet", 2, totalSteps);
+
+  const prompt = buildSheetPrompt(
+    params.prompt,
     params.animation,
     params.frameCount,
+    genGrid.cols,
     params.frameDescriptions
   );
+
+  const result = await generator.generate({
+    prompt,
+    type: "sprite_sheet",
+    quality: params.quality,
+    background: params.background ?? "transparent",
+    outputDir: params.outputDir,
+    width: imgWidth,
+    height: imgHeight,
+  });
+
+  const fs = await import("node:fs");
+  const sheetBuffer = fs.readFileSync(result.filePath);
+  try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
+
+  // Step 3: Split into frames with adaptive inset
+  onProgress?.("Splitting frames", 3, totalSteps);
   const rawFrames: Buffer[] = [];
 
   for (let row = 0; row < genGrid.rows; row++) {
@@ -887,71 +919,22 @@ export async function generateSingleSheet(
       const frameIndex = row * genGrid.cols + col;
       if (frameIndex >= params.frameCount) break;
 
-      const step = frameIndex + 2;
-      onProgress?.(
-        `Generating frame ${frameIndex + 1}/${params.frameCount}`,
-        step,
-        totalSteps
+      const { frame } = await extractFrameAdaptive(
+        sheetBuffer,
+        col * cellWidth,
+        row * cellHeight,
+        cellWidth,
+        cellHeight
       );
-
-      // Create a mask that exposes only THIS cell
-      const cellMask = await createSingleCellMask(
-        imgWidth, imgHeight,
-        genGrid.cols, genGrid.rows,
-        col, row
-      );
-
-      const cellPrompt =
-        `Fill cell ${frameIndex + 1} with: ${params.prompt}, ${poses[frameIndex]}. ` +
-        `Center the character within the cell. ` +
-        `Keep the same proportions, colors, and art style as the other cells.`;
-
-      try {
-        const edited = await generator.editImage(
-          template,
-          cellPrompt,
-          {
-            quality: params.quality,
-            size,
-            mask: cellMask,
-            background: params.background ?? "transparent",
-          }
-        );
-
-        // Extract just this cell from the result
-        const frame = await sharp(edited)
-          .extract({
-            left: col * cellWidth,
-            top: row * cellHeight,
-            width: cellWidth,
-            height: cellHeight,
-          })
-          .png()
-          .toBuffer();
-        rawFrames.push(frame);
-      } catch {
-        // Fallback: generate this frame standalone
-        console.error(`Edit API failed for frame ${frameIndex + 1}, generating standalone`);
-        const result = await generator.generate({
-          prompt: `${params.prompt}, ${poses[frameIndex]}, centered on canvas`,
-          type: "game_sprite",
-          quality: params.quality,
-          background: params.background ?? "transparent",
-          outputDir: params.outputDir,
-        });
-        const fs = await import("node:fs");
-        rawFrames.push(fs.readFileSync(result.filePath));
-        try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
-      }
+      rawFrames.push(frame);
     }
   }
 
   // Post-processing: position stabilization + transparency cleanup
   const skipTrimCenter = params.background === "opaque";
-  const postStep = params.frameCount + 2;
   onProgress?.(
     skipTrimCenter ? "Normalizing frames" : "Stabilizing position and cleaning alpha",
-    postStep,
+    4,
     totalSteps
   );
 
@@ -1055,10 +1038,10 @@ export async function generateSingleSheet(
   }
 
   // Quality gate
-  onProgress?.("Running quality checks", postStep + 1, totalSteps);
+  onProgress?.("Running quality checks", 5, totalSteps);
   const quality = await runQualityChecks(outputFrames, params.frameCount, targetSize);
 
-  onProgress?.("Frames ready", postStep + 2, totalSteps);
+  onProgress?.("Frames ready", 6, totalSteps);
 
   // Stitch processed frames into a raw sheet for the return value
   const rawSheet = await stitchFrames(outputFrames, genGrid.cols, targetSize, targetSize);
