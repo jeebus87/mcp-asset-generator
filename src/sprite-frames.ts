@@ -513,28 +513,30 @@ function removeFragments(
 
   if (components.length <= 1) return;
 
-  const largest = Math.max(...components.map(c => c.indices.length));
-  const sizeThreshold = Math.max(largest * minFraction, 50);
+  // Total non-transparent pixel count across all components
+  const totalPixels = components.reduce((s, c) => s + c.indices.length, 0);
 
-  // Edge zone: outer 20% band on each side
+  // Absolute size floor: anything above this is never removed.
+  // Prevents eating large legitimate content (fire streams, weapons,
+  // effects) that may outgrow the character body.
+  const absoluteFloor = Math.max(totalPixels * 0.08, 300);
+
+  // Edge zone: outer 20% band on each side — bleed comes from adjacent cells
   const edgeX = width * 0.20;
   const edgeY = height * 0.20;
-  // Fragments in the edge zone survive only if they are >= 15% of the body
-  const edgeSurvivalThreshold = largest * 0.15;
 
   for (const comp of components) {
     const size = comp.indices.length;
-    if (size === largest) continue; // never remove the main body
 
+    // Never remove large components — they are real content
+    if (size >= absoluteFloor) continue;
+
+    // Small components: only remove if they are in the edge zone
     const inEdgeZone =
       comp.cx < edgeX || comp.cx > width - edgeX ||
       comp.cy < edgeY || comp.cy > height - edgeY;
 
-    const shouldRemove =
-      size < sizeThreshold ||                          // too small
-      (inEdgeZone && size < edgeSurvivalThreshold);    // in edge zone and not big enough
-
-    if (shouldRemove) {
+    if (inEdgeZone) {
       for (const idx of comp.indices) {
         pixels[idx * 4] = 0;
         pixels[idx * 4 + 1] = 0;
