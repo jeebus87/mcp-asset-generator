@@ -360,7 +360,7 @@ async function extractFrameAdaptive(
   cellWidth: number,
   cellHeight: number
 ): Promise<{ frame: Buffer; insetUsed: number }> {
-  const INSET_STEPS = [0.05, 0.07, 0.10, 0.13, 0.16];
+  const INSET_STEPS = [0.02, 0.03, 0.05, 0.07, 0.10];
   const BLEED_THRESHOLD = 0.02; // >2% border-band content = bleed
 
   for (const insetFrac of INSET_STEPS) {
@@ -965,24 +965,12 @@ export async function generateSingleSheet(
       // Strip registration marks
       stripMarksFromPixels(pixels, targetSize, targetSize);
 
-      // Hard border erase: set outermost 6% on all sides to transparent.
-      // After adaptive inset + resize, bleed can extend 25-30px from
-      // the edge of the resized frame. 6% of 512 = ~31px.
-      const borderErase = Math.round(targetSize * 0.06);
-      for (let y = 0; y < targetSize; y++) {
-        for (let x = 0; x < targetSize; x++) {
-          if (y < borderErase || y >= targetSize - borderErase ||
-              x < borderErase || x >= targetSize - borderErase) {
-            const pi = (y * targetSize + x) * 4;
-            pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = pixels[pi + 3] = 0;
-          }
-        }
-      }
-
       // Clean alpha (soft mode for PNG)
       cleanAlpha(pixels, targetSize, targetSize, "soft");
 
-      // Remove remaining isolated fragments via dilation-based analysis
+      // Remove disconnected bleed fragments via dilation-based analysis.
+      // No border erase -- the character's own body (wings, tail) can
+      // extend to the edges. Only disconnected fragments get removed.
       removeFragments(pixels, targetSize, targetSize, 0.05);
 
       // Find bounding box center
