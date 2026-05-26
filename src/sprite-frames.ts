@@ -318,30 +318,27 @@ function pickGenerationGrid(frameCount: number): { cols: number; rows: number } 
 
 /**
  * Check if a frame has content bleeding at its edges.
- * Returns the fraction of edge pixels that are non-transparent.
+ * Scans a border BAND (outer 5% of the frame on each side), not just the
+ * outermost pixel row. This catches bleed fragments that are a few pixels
+ * inside the edge -- the common case with AI-generated sprite grids.
+ * Returns the fraction of border-band pixels that are non-transparent.
  */
 function measureEdgeBleed(pixels: Uint8Array, width: number, height: number): number {
+  const bandW = Math.max(3, Math.round(width * 0.05));
+  const bandH = Math.max(3, Math.round(height * 0.05));
   let edgePixels = 0;
   let contentPixels = 0;
 
-  // Check top and bottom rows
-  for (let x = 0; x < width; x++) {
-    // Top row
-    if (pixels[(0 * width + x) * 4 + 3] > 0) contentPixels++;
-    edgePixels++;
-    // Bottom row
-    if (pixels[((height - 1) * width + x) * 4 + 3] > 0) contentPixels++;
-    edgePixels++;
-  }
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const inBand =
+        y < bandH || y >= height - bandH ||
+        x < bandW || x >= width - bandW;
+      if (!inBand) continue;
 
-  // Check left and right columns (excluding corners already counted)
-  for (let y = 1; y < height - 1; y++) {
-    // Left column
-    if (pixels[(y * width + 0) * 4 + 3] > 0) contentPixels++;
-    edgePixels++;
-    // Right column
-    if (pixels[(y * width + (width - 1)) * 4 + 3] > 0) contentPixels++;
-    edgePixels++;
+      edgePixels++;
+      if (pixels[(y * width + x) * 4 + 3] > 0) contentPixels++;
+    }
   }
 
   return edgePixels > 0 ? contentPixels / edgePixels : 0;
@@ -349,7 +346,8 @@ function measureEdgeBleed(pixels: Uint8Array, width: number, height: number): nu
 
 /**
  * Extract a frame from a sheet with adaptive inset.
- * Starts at 3% inset, increases if >5% of edge pixels have content (bleed).
+ * Starts at 5% inset (AI grids rarely have clean 3% edges), increases if
+ * more than 2% of the border band has content.
  */
 async function extractFrameAdaptive(
   sheetBuffer: Buffer,
@@ -358,8 +356,8 @@ async function extractFrameAdaptive(
   cellWidth: number,
   cellHeight: number
 ): Promise<{ frame: Buffer; insetUsed: number }> {
-  const INSET_STEPS = [0.03, 0.05, 0.07, 0.10, 0.12];
-  const BLEED_THRESHOLD = 0.05; // >5% edge content = bleed
+  const INSET_STEPS = [0.05, 0.07, 0.10, 0.13, 0.16];
+  const BLEED_THRESHOLD = 0.02; // >2% border-band content = bleed
 
   for (const insetFrac of INSET_STEPS) {
     const insetX = Math.round(cellWidth * insetFrac);
@@ -430,6 +428,119 @@ function stripMarksFromPixels(pixels: Uint8Array, _width: number, _height: numbe
     // Detect magenta registration marks (allow some tolerance)
     if (r > 200 && g < 50 && b > 200) {
       pixels[i + 3] = 0; // make transparent
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fragment removal: erase small isolated pixel clusters
+// ---------------------------------------------------------------------------
+
+/**
+ * Flood-fill to find a connected component of non-transparent pixels.
+ * Returns the set of pixel indices belonging to the component.
+ */
+function floodFill(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  startX: number,
+  startY: number,
+  visited: Uint8Array
+): number[] {
+  const cluster: number[] = [];
+  const stack: [number, number][] = [[startX, startY]];
+
+  while (stack.length > 0) {
+    const [x, y] = stack.pop()!;
+    if (x < 0 || x >= width || y < 0 || y >= height) continue;
+    const idx = y * width + x;
+    if (visited[idx]) continue;
+    if (pixels[idx * 4 + 3] === 0) continue; // transparent
+
+    visited[idx] = 1;
+    cluster.push(idx);
+
+    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+
+  return cluster;
+}
+
+/**
+ * Remove isolated pixel clusters from a frame using two filters:
+ *
+ * 1. **Size filter** — clusters smaller than `minFraction` of the largest
+ *    component are erased. Catches tiny bleed specks and AI debris.
+ *
+ * 2. **Edge-zone filter** — clusters whose centroid falls in the outer 20%
+ *    of the frame are erased UNLESS they are at least 15% of the largest
+ *    component. Bleed fragments come from adjacent cells and land near
+ *    frame edges, so spatial position is a strong bleed signal even when
+ *    the fragment is too large for the size filter alone.
+ */
+function removeFragments(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  minFraction: number = 0.05
+): void {
+  const visited = new Uint8Array(width * height);
+  const components: { indices: number[]; cx: number; cy: number }[] = [];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (visited[idx]) continue;
+      if (pixels[idx * 4 + 3] === 0) continue;
+
+      const indices = floodFill(pixels, width, height, x, y, visited);
+      if (indices.length > 0) {
+        // Compute centroid
+        let sumX = 0, sumY = 0;
+        for (const i of indices) {
+          sumX += i % width;
+          sumY += Math.floor(i / width);
+        }
+        components.push({
+          indices,
+          cx: sumX / indices.length,
+          cy: sumY / indices.length,
+        });
+      }
+    }
+  }
+
+  if (components.length <= 1) return;
+
+  const largest = Math.max(...components.map(c => c.indices.length));
+  const sizeThreshold = Math.max(largest * minFraction, 50);
+
+  // Edge zone: outer 20% band on each side
+  const edgeX = width * 0.20;
+  const edgeY = height * 0.20;
+  // Fragments in the edge zone survive only if they are >= 15% of the body
+  const edgeSurvivalThreshold = largest * 0.15;
+
+  for (const comp of components) {
+    const size = comp.indices.length;
+    if (size === largest) continue; // never remove the main body
+
+    const inEdgeZone =
+      comp.cx < edgeX || comp.cx > width - edgeX ||
+      comp.cy < edgeY || comp.cy > height - edgeY;
+
+    const shouldRemove =
+      size < sizeThreshold ||                          // too small
+      (inEdgeZone && size < edgeSurvivalThreshold);    // in edge zone and not big enough
+
+    if (shouldRemove) {
+      for (const idx of comp.indices) {
+        pixels[idx * 4] = 0;
+        pixels[idx * 4 + 1] = 0;
+        pixels[idx * 4 + 2] = 0;
+        pixels[idx * 4 + 3] = 0;
+      }
     }
   }
 }
@@ -675,10 +786,10 @@ export async function runQualityChecks(
 
   const alphaClean = dirtyAlphaCount === 0;
 
-  // Generate warnings
-  if (edgeBleedScore > 0.05) {
+  // Generate warnings (thresholds match adaptive inset's BLEED_THRESHOLD)
+  if (edgeBleedScore > 0.02) {
     warnings.push(
-      `Edge bleed detected: ${(edgeBleedScore * 100).toFixed(1)}% of edge pixels have content`
+      `Edge bleed detected: ${(edgeBleedScore * 100).toFixed(1)}% of border-band pixels have content`
     );
   }
   if (positionVariance > 0.05) {
@@ -844,6 +955,11 @@ export async function generateSingleSheet(
 
       // Clean alpha (soft mode for PNG)
       cleanAlpha(pixels, targetSize, targetSize, "soft");
+
+      // Remove small isolated fragments (bleed debris + AI artifacts).
+      // 5% of largest component -- tuned to catch wing-tip fragments while
+      // preserving fire streams that are connected to the character body.
+      removeFragments(pixels, targetSize, targetSize, 0.05);
 
       // Find bounding box center
       let left = targetSize, top = targetSize, right = 0, bottom = 0;
