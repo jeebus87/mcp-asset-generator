@@ -163,18 +163,24 @@ export class ImageGenerator {
       size?: "1024x1024" | "1536x1024" | "1024x1536";
       mask?: Buffer;
       background?: "transparent" | "opaque";
+      inputFidelity?: "low" | "high";
+      model?: string;
     }
   ): Promise<Buffer> {
     const imageFile = new File([new Uint8Array(sourceBuffer)], "source.png", { type: "image/png" });
 
     const editParams: Record<string, unknown> = {
-      model: "gpt-image-1",
+      model: options?.model ?? "gpt-image-1",
       image: imageFile,
       prompt,
       n: 1,
       size: options?.size ?? "1024x1024",
       background: options?.background ?? "transparent",
     };
+
+    if (options?.inputFidelity) {
+      editParams.input_fidelity = options.inputFidelity;
+    }
 
     if (options?.mask) {
       editParams.mask = new File([new Uint8Array(options.mask)], "mask.png", { type: "image/png" });

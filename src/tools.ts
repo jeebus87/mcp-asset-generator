@@ -23,6 +23,7 @@ import {
 import {
   generateFrames,
   generateSingleSheet,
+  generateHybridSheet,
   stitchFrames,
   cleanFramesForGif,
 } from "./sprite-frames.js";
@@ -645,9 +646,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
   server.tool(
     "generate_sprite_sheet_hq",
     "Generate a high-quality sprite sheet with consistent character design across all frames. " +
-      "Uses a master sprite sheet approach: all frames are generated in a single image so the " +
-      "AI maintains identical proportions, colors, and style. Frames are then split, centered, " +
-      "and stitched into a clean grid. Includes animated GIF preview and JSON metadata.",
+      "Uses a hybrid pipeline: generates a seed frame, then uses the edit API to create an " +
+      "animation strip anchored to the seed for character consistency. Frames are extracted " +
+      "by contour detection (not grid splitting) for clean isolation. Includes animated GIF " +
+      "preview and JSON metadata.",
     {
       prompt: z
         .string()
@@ -712,9 +714,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         .boolean()
         .optional()
         .describe(
-          "Use per-frame edit API instead of single-sheet generation. " +
-            "Produces more distinct poses but less character consistency. " +
-            "Default false (single-sheet mode recommended)."
+          "Generation mode override. Default (unset): hybrid pipeline -- generates a seed " +
+            "frame then uses the edit API to create an animation strip with contour-based " +
+            "extraction. Set to true for legacy per-frame edit mode. Set to false for " +
+            "single-sheet mode (fastest but may have frame bleed)."
         ),
     },
     GENERATION_ANNOTATIONS,
@@ -725,9 +728,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
       const animName = args.animation ?? "idle";
       const fps = args.fps ?? 12;
       const usePerFrame = args.per_frame_mode === true;
+      const useSingleSheet = args.per_frame_mode === false;
+      // Default: hybrid pipeline (seed + edit strip + contour extraction)
 
-      const wantGif = args.gif !== false; // default true
-      const totalSteps = (usePerFrame ? frameCount : 4) + 2 + (wantGif ? 1 : 0);
+      const wantGif = args.gif !== false;
 
       const sendProgress = async (step: string, progress: number, total: number) => {
         const progressToken = extra._meta?.progressToken;
@@ -748,7 +752,6 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         let qualityMetrics: import("./sprite-frames.js").SpriteQualityMetrics | undefined;
 
         if (usePerFrame) {
-          // Per-frame edit mode (legacy, more distinct poses but less consistency)
           mode = "per-frame edit";
           apiCalls = frameCount;
           const result = await generateFrames(
@@ -763,14 +766,13 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
               background: args.background as "transparent" | "opaque" | undefined,
             },
             (step, progress, _total) => {
-              sendProgress(step, progress, totalSteps);
+              sendProgress(step, progress, frameCount + 3);
             }
           );
           frameBuffers = result;
           frameWidth = 1024;
           frameHeight = 1024;
-        } else {
-          // Single-sheet mode (best character consistency)
+        } else if (useSingleSheet) {
           mode = "single-sheet";
           apiCalls = 1;
           const result = await generateSingleSheet(
@@ -785,7 +787,31 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
               background: args.background as "transparent" | "opaque" | undefined,
             },
             (step, progress, _total) => {
-              sendProgress(step, progress, totalSteps);
+              sendProgress(step, progress, 6);
+            }
+          );
+          frameBuffers = result.frames;
+          frameWidth = result.frameWidth;
+          frameHeight = result.frameHeight;
+          qualityMetrics = result.quality;
+        } else {
+          // Default: hybrid pipeline
+          mode = "hybrid";
+          const batchCount = Math.ceil(frameCount / 6);
+          apiCalls = 1 + batchCount; // seed + N strip edits
+          const result = await generateHybridSheet(
+            generator,
+            {
+              prompt: args.prompt,
+              animation: animName,
+              frameCount,
+              columns,
+              frameDescriptions: args.frame_descriptions,
+              quality: args.quality as QualityTier | undefined,
+              background: args.background as "transparent" | "opaque" | undefined,
+            },
+            (step, progress, total) => {
+              sendProgress(step, progress, total);
             }
           );
           frameBuffers = result.frames;
@@ -795,13 +821,11 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         }
 
         // Stitch frames into clean grid
-        const stitchStep = usePerFrame ? frameCount + 1 : 5;
-        await sendProgress("Stitching frames into sprite sheet", stitchStep, totalSteps);
+        await sendProgress("Stitching frames into sprite sheet", 1, 3);
         const sheetBuffer = await stitchFrames(frameBuffers, columns, frameWidth, frameHeight);
 
         // Save
-        const saveStep = stitchStep + 1;
-        await sendProgress("Saving sprite sheet and metadata", saveStep, totalSteps);
+        await sendProgress("Saving sprite sheet and metadata", 2, 3);
         const outputDir = process.env.ASSET_OUTPUT_DIR || "assets";
         const filePath = saveImage(sheetBuffer, "sprite_sheet", args.prompt, outputDir);
 
@@ -821,7 +845,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         // Generate animated GIF preview (with binary alpha cleanup for GIF)
         let gifPath: string | null = null;
         if (wantGif) {
-          await sendProgress("Creating animated GIF preview", saveStep + 1, totalSteps);
+          await sendProgress("Creating animated GIF preview", 3, 3);
 
           let gifBg: { r: number; g: number; b: number } | null | undefined;
           if (args.gif_background === "transparent") {
@@ -860,9 +884,11 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         output.push(
           `  API calls: ${apiCalls}`,
           ``,
-          mode === "single-sheet"
-            ? `All frames generated via grid template + edit API for clean frame isolation,\nthen split, centered, and alpha-cleaned into individual frames.`
-            : `Each frame generated individually via edit API for maximum pose variety.`,
+          mode === "hybrid"
+            ? `Seed frame generated, then edit API produced animation strip with input_fidelity="high".\nFrames extracted by contour detection and normalized with bottom-center anchoring.`
+            : mode === "single-sheet"
+            ? `All frames generated in a single image, then split and post-processed.`
+            : `Each frame generated individually via edit API.`,
         );
 
         // Append quality gate warnings if any

@@ -59,6 +59,528 @@ const ANIMATION_PRESETS: Record<string, string[]> = {
   ],
 };
 
+/**
+ * Generate a single standalone character frame to use as the seed/anchor
+ * for the hybrid sprite pipeline. The seed is generated at full 1024x1024
+ * resolution with the character's neutral/first pose.
+ */
+export async function generateSeedFrame(
+  generator: ImageGenerator,
+  characterPrompt: string,
+  firstPose: string,
+  options?: {
+    quality?: QualityTier;
+    background?: "transparent" | "opaque";
+  }
+): Promise<Buffer> {
+  const prompt =
+    `A single game character on a clean background: ${characterPrompt}, ${firstPose}. ` +
+    `The character is centered in the image, fully visible from head to toe, ` +
+    `with empty space on all sides. Game sprite style, clean edges, consistent lighting.`;
+
+  const result = await generator.generate({
+    prompt,
+    type: "game_sprite",
+    quality: options?.quality ?? "high",
+    background: options?.background ?? "transparent",
+    width: 1024,
+    height: 1024,
+  });
+
+  const fs = await import("node:fs");
+  const buffer = fs.readFileSync(result.filePath);
+  try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
+  return buffer;
+}
+
+/**
+ * Build an edit canvas by placing the seed frame at the leftmost position
+ * of a 1536x1024 transparent canvas. The seed is resized to fit one column
+ * of the strip layout.
+ *
+ * Returns the canvas buffer and the column width used.
+ */
+export async function buildEditCanvas(
+  seedBuffer: Buffer,
+  stripColumns: number
+): Promise<{ canvas: Buffer; columnWidth: number }> {
+  const canvasWidth = 1536;
+  const canvasHeight = 1024;
+  const columnWidth = Math.floor(canvasWidth / stripColumns);
+
+  // Resize seed to fit in one column, maintaining aspect ratio
+  const resizedSeed = await sharp(seedBuffer)
+    .resize(columnWidth, canvasHeight, {
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+
+  // Place seed at the leftmost column
+  const canvas = await sharp({
+    create: {
+      width: canvasWidth,
+      height: canvasHeight,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([{ input: resizedSeed, left: 0, top: 0 }])
+    .png()
+    .toBuffer();
+
+  return { canvas, columnWidth };
+}
+
+/**
+ * Build a mask for the edit canvas. The seed column (leftmost) is opaque
+ * (preserved). All other columns are transparent (editable).
+ * Built with raw pixels -- SVG can't punch transparent holes through opaque layers.
+ */
+export async function buildStripMask(
+  stripColumns: number
+): Promise<Buffer> {
+  const canvasWidth = 1536;
+  const canvasHeight = 1024;
+  const columnWidth = Math.floor(canvasWidth / stripColumns);
+
+  const pixels = new Uint8Array(canvasWidth * canvasHeight * 4);
+
+  for (let y = 0; y < canvasHeight; y++) {
+    for (let x = 0; x < canvasWidth; x++) {
+      const i = (y * canvasWidth + x) * 4;
+      if (x < columnWidth) {
+        // Seed column: opaque (preserved)
+        pixels[i] = 0;
+        pixels[i + 1] = 0;
+        pixels[i + 2] = 0;
+        pixels[i + 3] = 255;
+      } else {
+        // Editable area: transparent
+        pixels[i] = 0;
+        pixels[i + 1] = 0;
+        pixels[i + 2] = 0;
+        pixels[i + 3] = 0;
+      }
+    }
+  }
+
+  return sharp(Buffer.from(pixels), {
+    raw: { width: canvasWidth, height: canvasHeight, channels: 4 },
+  }).png().toBuffer();
+}
+
+/**
+ * Extract individual character frames from a sprite strip using
+ * contour-based detection. Instead of splitting on grid lines (which
+ * includes bleed), this finds each character blob via connected
+ * components and extracts by bounding box.
+ *
+ * Uses sharp's built-in threshold + dilate for fast native-code processing,
+ * then a two-pass Union-Find CCL algorithm for component labeling.
+ *
+ * Returns frames sorted left-to-right (animation order).
+ */
+export async function extractFramesByContour(
+  stripBuffer: Buffer,
+  expectedFrameCount: number
+): Promise<{ frames: Buffer[]; bboxes: { left: number; top: number; width: number; height: number }[] }> {
+  const meta = await sharp(stripBuffer).metadata();
+  const imgWidth = meta.width!;
+  const imgHeight = meta.height!;
+
+  // Step 1: Build a binary mask from the alpha channel using sharp builtins
+  // extractChannel(3) = alpha, threshold(1) = any alpha > 0 becomes 255
+  const alphaMask = await sharp(stripBuffer)
+    .ensureAlpha()
+    .extractChannel(3)
+    .threshold(1)
+    .raw()
+    .toBuffer();
+
+  // Step 2: Dilate the mask to bridge small gaps between body parts
+  // Chain 4 dilations (~4px radius) -- enough for pixel art gaps,
+  // conservative enough that adjacent frame blobs stay separate
+  const dilatedMask = await sharp(
+    await sharp(stripBuffer)
+      .ensureAlpha()
+      .extractChannel(3)
+      .threshold(1)
+      .png()
+      .toBuffer()
+  )
+    .dilate().dilate().dilate().dilate()
+    .raw()
+    .toBuffer();
+
+  const dilatedPixels = new Uint8Array(dilatedMask.buffer, dilatedMask.byteOffset, dilatedMask.byteLength);
+
+  // Step 3: Two-pass Union-Find connected component labeling on dilated mask
+  const labels = new Uint32Array(imgWidth * imgHeight);
+  const parent = new Uint32Array(imgWidth * imgHeight + 1);
+  let nextLabel = 1;
+
+  function find(x: number): number {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]]; // path compression
+      x = parent[x];
+    }
+    return x;
+  }
+  function union(a: number, b: number): void {
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  }
+
+  // Pass 1: assign provisional labels (8-connectivity)
+  for (let y = 0; y < imgHeight; y++) {
+    for (let x = 0; x < imgWidth; x++) {
+      const idx = y * imgWidth + x;
+      if (!dilatedPixels[idx]) continue;
+
+      const neighbors: number[] = [];
+      if (x > 0 && labels[idx - 1]) neighbors.push(labels[idx - 1]);
+      if (y > 0 && labels[idx - imgWidth]) neighbors.push(labels[idx - imgWidth]);
+      if (x > 0 && y > 0 && labels[idx - imgWidth - 1]) neighbors.push(labels[idx - imgWidth - 1]);
+      if (x < imgWidth - 1 && y > 0 && labels[idx - imgWidth + 1]) neighbors.push(labels[idx - imgWidth + 1]);
+
+      if (neighbors.length === 0) {
+        labels[idx] = nextLabel;
+        parent[nextLabel] = nextLabel;
+        nextLabel++;
+      } else {
+        const minLabel = Math.min(...neighbors);
+        labels[idx] = minLabel;
+        for (const n of neighbors) union(n, minLabel);
+      }
+    }
+  }
+
+  // Pass 2: resolve labels and compute bounding boxes
+  const bboxMap = new Map<number, { left: number; top: number; right: number; bottom: number; area: number }>();
+
+  for (let y = 0; y < imgHeight; y++) {
+    for (let x = 0; x < imgWidth; x++) {
+      const idx = y * imgWidth + x;
+      if (!labels[idx]) continue;
+      const resolved = find(labels[idx]);
+      labels[idx] = resolved;
+
+      // Only track bounding boxes using the ORIGINAL (undilated) alpha mask
+      // so bounding boxes are tight around actual content, not the dilated version
+      if (!alphaMask[idx]) continue;
+
+      const bbox = bboxMap.get(resolved);
+      if (bbox) {
+        bbox.left = Math.min(bbox.left, x);
+        bbox.top = Math.min(bbox.top, y);
+        bbox.right = Math.max(bbox.right, x);
+        bbox.bottom = Math.max(bbox.bottom, y);
+        bbox.area++;
+      } else {
+        bboxMap.set(resolved, { left: x, top: y, right: x, bottom: y, area: 1 });
+      }
+    }
+  }
+
+  // Step 4: Filter to significant blobs and sort left-to-right
+  const minArea = (imgWidth * imgHeight) * 0.005; // at least 0.5% of image
+  const blobs = Array.from(bboxMap.values())
+    .filter(b => b.area >= minArea)
+    .sort((a, b) => a.left - b.left);
+
+  // Step 5: Extract each blob from the ORIGINAL image (not dilated)
+  const frames: Buffer[] = [];
+  const bboxes: { left: number; top: number; width: number; height: number }[] = [];
+
+  for (const blob of blobs) {
+    const w = blob.right - blob.left + 1;
+    const h = blob.bottom - blob.top + 1;
+
+    const frame = await sharp(stripBuffer)
+      .extract({ left: blob.left, top: blob.top, width: w, height: h })
+      .png()
+      .toBuffer();
+
+    frames.push(frame);
+    bboxes.push({ left: blob.left, top: blob.top, width: w, height: h });
+  }
+
+  // If we got fewer frames than expected, the AI merged some blobs.
+  // If more, the AI added extra content. Truncate or pad as needed.
+  while (frames.length > expectedFrameCount) frames.pop();
+
+  return { frames, bboxes };
+}
+
+/**
+ * Normalize extracted frames to a uniform size with bottom-center anchoring.
+ *
+ * 1. Find the largest bounding box across all frames
+ * 2. Resize each frame to that size (contain + transparent padding)
+ * 3. Anchor at bottom-center so feet stay on a consistent ground line
+ * 4. Clean alpha using sharp's built-in erode/dilate (morphological opening)
+ *
+ * @param mode "soft" preserves anti-aliasing (PNG), "binary" snaps to 0/255 (GIF)
+ */
+export async function normalizeFrames(
+  frames: Buffer[],
+  targetSize: number,
+  mode: "soft" | "binary" = "soft"
+): Promise<Buffer[]> {
+  if (frames.length === 0) return [];
+
+  // Step 1: Find the content bounding box of each frame using sharp's trim()
+  const trimInfos: { width: number; height: number; trimOffsetLeft: number; trimOffsetTop: number; originalWidth: number; originalHeight: number }[] = [];
+
+  for (const frame of frames) {
+    const originalMeta = await sharp(frame).metadata();
+    try {
+      const trimmed = await sharp(frame)
+        .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 }, threshold: 10 })
+        .toBuffer({ resolveWithObject: true });
+      trimInfos.push({
+        width: trimmed.info.width,
+        height: trimmed.info.height,
+        trimOffsetLeft: trimmed.info.trimOffsetLeft ?? 0,
+        trimOffsetTop: trimmed.info.trimOffsetTop ?? 0,
+        originalWidth: originalMeta.width ?? targetSize,
+        originalHeight: originalMeta.height ?? targetSize,
+      });
+    } catch {
+      // trim() can fail on empty frames
+      trimInfos.push({
+        width: originalMeta.width ?? targetSize,
+        height: originalMeta.height ?? targetSize,
+        trimOffsetLeft: 0,
+        trimOffsetTop: 0,
+        originalWidth: originalMeta.width ?? targetSize,
+        originalHeight: originalMeta.height ?? targetSize,
+      });
+    }
+  }
+
+  // Step 2: Determine uniform output size
+  // Use targetSize as the output dimension (square frames)
+  const outputSize = targetSize;
+
+  // Step 3: Process each frame with bottom-center anchoring
+  const output: Buffer[] = [];
+
+  for (let i = 0; i < frames.length; i++) {
+    // Trim to content
+    let trimmed: Buffer;
+    try {
+      trimmed = await sharp(frames[i])
+        .trim({ background: { r: 0, g: 0, b: 0, alpha: 0 }, threshold: 10 })
+        .png()
+        .toBuffer();
+    } catch {
+      trimmed = frames[i]; // use as-is if trim fails
+    }
+
+    // Resize to fit within outputSize, maintaining aspect ratio
+    const fitted = await sharp(trimmed)
+      .resize(outputSize, outputSize, {
+        fit: "contain",
+        position: "bottom",  // bottom-center anchor -- feet on ground line
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      })
+      .png()
+      .toBuffer();
+
+    // Alpha cleanup using morphological operations
+    if (mode === "binary") {
+      // GIF mode: binarize alpha
+      const cleaned = await sharp(fitted)
+        .ensureAlpha()
+        .png()
+        .toBuffer();
+      // Extract alpha, threshold, recombine
+      const rgb = await sharp(cleaned).removeAlpha().raw().toBuffer();
+      const alpha = await sharp(cleaned)
+        .extractChannel(3)
+        .threshold(128)
+        .raw()
+        .toBuffer();
+      const meta = await sharp(cleaned).metadata();
+      const w = meta.width!;
+      const h = meta.height!;
+      const combined = new Uint8Array(w * h * 4);
+      for (let j = 0; j < w * h; j++) {
+        combined[j * 4] = rgb[j * 3];
+        combined[j * 4 + 1] = rgb[j * 3 + 1];
+        combined[j * 4 + 2] = rgb[j * 3 + 2];
+        combined[j * 4 + 3] = alpha[j];
+      }
+      output.push(
+        await sharp(Buffer.from(combined), { raw: { width: w, height: h, channels: 4 } })
+          .png().toBuffer()
+      );
+    } else {
+      // Soft mode: morphological opening on alpha (erode then dilate)
+      // removes 1px semi-transparent fringe while preserving shape
+      output.push(fitted);
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Hybrid sprite pipeline (OpenAI's recommended approach):
+ *
+ * 1. Generate a seed frame (standalone character, full resolution)
+ * 2. Place seed on a 1536x1024 canvas as the first frame in a strip
+ * 3. Use the edit API with input_fidelity="high" to generate remaining
+ *    frames -- the seed anchors character consistency
+ * 4. Extract frames via contour-based connected component analysis
+ *    (not grid splitting -- immune to frame bleed)
+ * 5. Normalize all frames to uniform size with bottom-center anchoring
+ *
+ * For 7+ frames, generates in batches of 6 (max per strip).
+ */
+export async function generateHybridSheet(
+  generator: ImageGenerator,
+  params: SpriteSheetParams,
+  onProgress?: (step: string, progress: number, total: number) => void
+): Promise<{
+  frames: Buffer[];
+  frameWidth: number;
+  frameHeight: number;
+  quality?: SpriteQualityMetrics;
+}> {
+  const poses = resolveFramePoses(
+    params.animation,
+    params.frameCount,
+    params.frameDescriptions
+  );
+
+  const MAX_FRAMES_PER_STRIP = 6;
+  const batchCount = Math.ceil(params.frameCount / MAX_FRAMES_PER_STRIP);
+  const totalSteps = 2 + batchCount + 2; // seed + canvas*N + normalize + quality
+
+  // Step 1: Generate seed frame
+  onProgress?.("Generating seed frame", 1, totalSteps);
+  const seedBuffer = await generateSeedFrame(
+    generator,
+    params.prompt,
+    poses[0],
+    {
+      quality: params.quality,
+      background: params.background,
+    }
+  );
+
+  // Step 2: Generate animation strips in batches
+  const allRawFrames: Buffer[] = [];
+
+  for (let batch = 0; batch < batchCount; batch++) {
+    const batchStart = batch * MAX_FRAMES_PER_STRIP;
+    const batchEnd = Math.min(batchStart + MAX_FRAMES_PER_STRIP, params.frameCount);
+    const batchFrameCount = batchEnd - batchStart;
+    const batchPoses = poses.slice(batchStart, batchEnd);
+
+    // For the first batch, include the seed as frame 1.
+    // For subsequent batches, the seed is still the anchor but all
+    // strip positions are new frames.
+    const stripColumns = batchFrameCount + 1; // seed column + N frame columns
+
+    onProgress?.(
+      `Generating strip ${batch + 1}/${batchCount} (frames ${batchStart + 1}-${batchEnd})`,
+      2 + batch,
+      totalSteps
+    );
+
+    // Build canvas with seed at position 0
+    const { canvas } = await buildEditCanvas(seedBuffer, stripColumns);
+    const mask = await buildStripMask(stripColumns);
+
+    // Build the edit prompt
+    const poseList = batchPoses
+      .map((pose, i) => `Frame ${i + 1}: ${pose}`)
+      .join(". ");
+
+    const editPrompt =
+      `A horizontal strip of ${batchFrameCount} animation frames to the right of the reference character. ` +
+      `Each frame must show the EXACT SAME character as the reference (leftmost) -- identical proportions, ` +
+      `colors, art style, outfit, and features. Only the pose changes. ` +
+      `${poseList}. ` +
+      `Each frame is separated by clear empty space. The character is centered within each frame position.`;
+
+    let stripResult: Buffer;
+    try {
+      stripResult = await generator.editImage(
+        canvas,
+        editPrompt,
+        {
+          quality: params.quality,
+          size: "1536x1024",
+          mask,
+          background: params.background ?? "transparent",
+          inputFidelity: "high",
+          model: "gpt-image-1",
+        }
+      );
+    } catch (error) {
+      // Fallback: generate each frame standalone
+      console.error(`Strip generation failed for batch ${batch + 1}, falling back to per-frame`);
+      for (const pose of batchPoses) {
+        const fb = await generateSeedFrame(generator, params.prompt, pose, {
+          quality: params.quality,
+          background: params.background,
+        });
+        allRawFrames.push(fb);
+      }
+      continue;
+    }
+
+    // Extract frames from the strip result via contour detection
+    // Skip the first blob (that's the seed) -- we only want the new frames
+    const { frames: extractedFrames } = await extractFramesByContour(
+      stripResult,
+      batchFrameCount + 1 // include seed blob in expected count
+    );
+
+    // Skip the first frame (seed) and take the rest
+    const newFrames = extractedFrames.slice(1);
+    allRawFrames.push(...newFrames);
+
+    // If contour extraction found fewer frames than expected,
+    // fall back to generating the missing frames standalone
+    const missing = batchFrameCount - newFrames.length;
+    if (missing > 0) {
+      console.error(`Contour extraction found ${newFrames.length}/${batchFrameCount} frames, generating ${missing} standalone`);
+      for (let i = newFrames.length; i < batchFrameCount; i++) {
+        const fb = await generateSeedFrame(generator, params.prompt, batchPoses[i], {
+          quality: params.quality,
+          background: params.background,
+        });
+        allRawFrames.push(fb);
+      }
+    }
+  }
+
+  // Step 3: Normalize all frames
+  onProgress?.("Normalizing frames", 2 + batchCount, totalSteps);
+  const targetSize = 512; // output frame size
+  const normalizedFrames = await normalizeFrames(allRawFrames, targetSize, "soft");
+
+  // Step 4: Quality gate
+  onProgress?.("Running quality checks", 2 + batchCount + 1, totalSteps);
+  const quality = await runQualityChecks(normalizedFrames, params.frameCount, targetSize);
+
+  onProgress?.("Frames ready", totalSteps, totalSteps);
+
+  return {
+    frames: normalizedFrames,
+    frameWidth: targetSize,
+    frameHeight: targetSize,
+    quality,
+  };
+}
+
 export interface SpriteSheetParams {
   prompt: string;
   animation: string;
@@ -84,173 +606,6 @@ export interface SpriteQualityMetrics {
   alphaClean: boolean;        // true if no dirty alpha pixels remain
   frameCountMatch: boolean;   // true if extracted frames == requested frames
   warnings: string[];         // human-readable quality warnings
-}
-
-// ---------------------------------------------------------------------------
-// Registration mark color and detection
-// ---------------------------------------------------------------------------
-
-/** Registration mark color: pure magenta, easy to detect and unlikely in game art */
-const MARK_COLOR = { r: 255, g: 0, b: 255 };
-const MARK_SIZE = 6; // L-shape arm length in pixels
-const MARK_THICKNESS = 2;
-const BORDER_THICKNESS = 2;
-
-// ---------------------------------------------------------------------------
-// Grid template creation
-// ---------------------------------------------------------------------------
-
-/**
- * Create a grid template image with cell borders, numbered labels, and
- * L-shaped corner registration marks. The AI sees this structure when
- * filling cells via the edit API.
- */
-async function createGridTemplate(
-  width: number,
-  height: number,
-  columns: number,
-  rows: number
-): Promise<{ template: Buffer; cellWidth: number; cellHeight: number }> {
-  const cellWidth = Math.floor(width / columns);
-  const cellHeight = Math.floor(height / rows);
-
-  // Build SVG with borders, numbers, and registration marks
-  const svgParts: string[] = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">`,
-    // Light gray background so the AI sees the grid clearly
-    `<rect width="${width}" height="${height}" fill="#e0e0e0"/>`,
-  ];
-
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < columns; col++) {
-      const cellIndex = row * columns + col;
-      const x = col * cellWidth;
-      const y = row * cellHeight;
-
-      // Cell border
-      svgParts.push(
-        `<rect x="${x}" y="${y}" width="${cellWidth}" height="${cellHeight}" ` +
-        `fill="none" stroke="#333333" stroke-width="${BORDER_THICKNESS}"/>`
-      );
-
-      // Cell number label (centered, semi-transparent so AI draws over it)
-      const labelX = x + cellWidth / 2;
-      const labelY = y + cellHeight / 2;
-      svgParts.push(
-        `<text x="${labelX}" y="${labelY}" text-anchor="middle" dominant-baseline="central" ` +
-        `font-family="Arial,sans-serif" font-size="${Math.min(cellWidth, cellHeight) * 0.3}" ` +
-        `fill="rgba(100,100,100,0.4)" font-weight="bold">${cellIndex + 1}</text>`
-      );
-
-      // L-shaped corner registration marks (magenta)
-      const markColor = `rgb(${MARK_COLOR.r},${MARK_COLOR.g},${MARK_COLOR.b})`;
-
-      // Top-left corner mark
-      svgParts.push(
-        `<rect x="${x}" y="${y}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
-        `<rect x="${x}" y="${y}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
-      );
-
-      // Top-right corner mark
-      svgParts.push(
-        `<rect x="${x + cellWidth - MARK_SIZE}" y="${y}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
-        `<rect x="${x + cellWidth - MARK_THICKNESS}" y="${y}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
-      );
-
-      // Bottom-left corner mark
-      svgParts.push(
-        `<rect x="${x}" y="${y + cellHeight - MARK_THICKNESS}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
-        `<rect x="${x}" y="${y + cellHeight - MARK_SIZE}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
-      );
-
-      // Bottom-right corner mark
-      svgParts.push(
-        `<rect x="${x + cellWidth - MARK_SIZE}" y="${y + cellHeight - MARK_THICKNESS}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
-        `<rect x="${x + cellWidth - MARK_THICKNESS}" y="${y + cellHeight - MARK_SIZE}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
-      );
-    }
-  }
-
-  svgParts.push(`</svg>`);
-
-  const template = await sharp(Buffer.from(svgParts.join("\n")))
-    .resize(width, height)
-    .png()
-    .toBuffer();
-
-  return { template, cellWidth, cellHeight };
-}
-
-/**
- * Create a mask that exposes only a single cell for editing.
- * The target cell interior is transparent (alpha=0, editable),
- * everything else is opaque (alpha=255, preserved).
- * Built with raw pixels because SVG can't punch transparent holes
- * through an opaque layer.
- */
-async function createSingleCellMask(
-  width: number,
-  height: number,
-  columns: number,
-  rows: number,
-  targetCol: number,
-  targetRow: number
-): Promise<Buffer> {
-  const cellWidth = Math.floor(width / columns);
-  const cellHeight = Math.floor(height / rows);
-  const inset = BORDER_THICKNESS + MARK_SIZE + 2;
-
-  // Start fully opaque (RGBA all 0,0,0,255)
-  const pixels = new Uint8Array(width * height * 4);
-  for (let i = 0; i < pixels.length; i += 4) {
-    pixels[i] = 0;     // R
-    pixels[i + 1] = 0; // G
-    pixels[i + 2] = 0; // B
-    pixels[i + 3] = 255; // A = opaque (preserved)
-  }
-
-  // Punch a transparent hole for the target cell interior
-  const startX = targetCol * cellWidth + inset;
-  const startY = targetRow * cellHeight + inset;
-  const endX = (targetCol + 1) * cellWidth - inset;
-  const endY = (targetRow + 1) * cellHeight - inset;
-
-  for (let y = startY; y < endY && y < height; y++) {
-    for (let x = startX; x < endX && x < width; x++) {
-      const i = (y * width + x) * 4;
-      pixels[i + 3] = 0; // A = transparent (editable)
-    }
-  }
-
-  return sharp(Buffer.from(pixels), {
-    raw: { width, height, channels: 4 },
-  }).png().toBuffer();
-}
-
-/**
- * Build the prompt for the edit API when filling the grid template.
- */
-function buildEditPrompt(
-  baseDescription: string,
-  animation: string,
-  frameCount: number,
-  columns: number,
-  customDescriptions?: string[]
-): string {
-  const poses = resolveFramePoses(animation, frameCount, customDescriptions);
-
-  const frameList = poses
-    .map((pose, i) => `Cell ${i + 1}: ${pose}`)
-    .join(". ");
-
-  return (
-    `Fill each numbered cell in this grid with: ${baseDescription}. ` +
-    `Each cell shows a different frame of a ${animation} animation. ` +
-    `${frameList}. ` +
-    `Center the character within each cell. ` +
-    `Keep the same character, proportions, colors, and art style in every cell. ` +
-    `Do not draw outside the cell borders. Keep the grid lines and corner marks visible.`
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -420,20 +775,6 @@ async function extractFrameAdaptive(
     .png()
     .toBuffer();
   return { frame, insetUsed: maxInset };
-}
-
-// ---------------------------------------------------------------------------
-// Strip registration marks from frame pixels
-// ---------------------------------------------------------------------------
-
-function stripMarksFromPixels(pixels: Uint8Array, _width: number, _height: number): void {
-  for (let i = 0; i < pixels.length; i += 4) {
-    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
-    // Detect magenta registration marks (allow some tolerance)
-    if (r > 200 && g < 50 && b > 200) {
-      pixels[i + 3] = 0; // make transparent
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -853,10 +1194,9 @@ export async function runQualityChecks(
 // ---------------------------------------------------------------------------
 
 /**
- * Generate a complete sprite sheet using the grid template + edit API approach.
- * Creates a numbered grid template, uses the edit API to fill each cell,
- * then post-processes with adaptive inset, position stabilization, and
- * premultiplied alpha correction.
+ * Generate a complete sprite sheet using the single-sheet approach.
+ * Generates all frames in a single API call, then splits into individual
+ * frames with adaptive inset, position stabilization, and alpha correction.
  */
 export async function generateSingleSheet(
   generator: ImageGenerator,
@@ -874,14 +1214,10 @@ export async function generateSingleSheet(
   const [imgWidth, imgHeight] = size.split("x").map(Number);
   const totalSteps = 6;
 
-  // Step 1: Create grid template
-  onProgress?.("Creating grid template", 1, totalSteps);
-  const { template, cellWidth, cellHeight } = await createGridTemplate(
-    imgWidth,
-    imgHeight,
-    genGrid.cols,
-    genGrid.rows
-  );
+  // Step 1: Calculate cell dimensions
+  onProgress?.("Calculating layout", 1, totalSteps);
+  const cellWidth = Math.floor(imgWidth / genGrid.cols);
+  const cellHeight = Math.floor(imgHeight / genGrid.rows);
 
   // Step 2: Generate full sprite sheet in one API call.
   // Single-sheet gives best character consistency since the AI draws all
@@ -961,9 +1297,6 @@ export async function generateSingleSheet(
         .toBuffer();
 
       const pixels = new Uint8Array(resized.buffer, resized.byteOffset, resized.byteLength);
-
-      // Strip registration marks
-      stripMarksFromPixels(pixels, targetSize, targetSize);
 
       // Clean alpha (soft mode for PNG)
       cleanAlpha(pixels, targetSize, targetSize, "soft");
