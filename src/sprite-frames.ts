@@ -182,42 +182,33 @@ async function createGridTemplate(
 }
 
 /**
- * Create a mask for the edit API. Transparent (alpha=0) areas are editable,
- * opaque areas are preserved. We make all cell interiors transparent so the
- * AI can fill them, and keep borders/marks opaque.
+ * Create a mask that exposes only a single cell for editing.
+ * The target cell is transparent (editable), everything else is opaque.
  */
-async function createEditMask(
+async function createSingleCellMask(
   width: number,
   height: number,
   columns: number,
-  rows: number
+  rows: number,
+  targetCol: number,
+  targetRow: number
 ): Promise<Buffer> {
   const cellWidth = Math.floor(width / columns);
   const cellHeight = Math.floor(height / rows);
-  const inset = BORDER_THICKNESS + MARK_SIZE + 2; // clear of borders and marks
+  const inset = BORDER_THICKNESS + MARK_SIZE + 2;
 
-  const svgParts: string[] = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">`,
-    // Start fully opaque (black = preserve)
-    `<rect width="${width}" height="${height}" fill="black"/>`,
-  ];
+  const x = targetCol * cellWidth + inset;
+  const y = targetRow * cellHeight + inset;
+  const w = cellWidth - inset * 2;
+  const h = cellHeight - inset * 2;
 
-  // Cut out cell interiors (transparent = editable)
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < columns; col++) {
-      const x = col * cellWidth + inset;
-      const y = row * cellHeight + inset;
-      const w = cellWidth - inset * 2;
-      const h = cellHeight - inset * 2;
-      svgParts.push(
-        `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="black" fill-opacity="0"/>`
-      );
-    }
-  }
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
+    `<rect width="${width}" height="${height}" fill="black"/>` +
+    `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="black" fill-opacity="0"/>` +
+    `</svg>`;
 
-  svgParts.push(`</svg>`);
-
-  return sharp(Buffer.from(svgParts.join("\n")))
+  return sharp(Buffer.from(svg))
     .resize(width, height)
     .png()
     .toBuffer();
@@ -437,11 +428,12 @@ function stripMarksFromPixels(pixels: Uint8Array, _width: number, _height: numbe
 // ---------------------------------------------------------------------------
 
 /**
- * Flood-fill to find a connected component of non-transparent pixels.
+ * Flood-fill on a binary mask (1 = filled, 0 = empty).
+ * Uses 8-connectivity (includes diagonals).
  * Returns the set of pixel indices belonging to the component.
  */
-function floodFill(
-  pixels: Uint8Array,
+function floodFillMask(
+  mask: Uint8Array,
   width: number,
   height: number,
   startX: number,
@@ -456,15 +448,51 @@ function floodFill(
     if (x < 0 || x >= width || y < 0 || y >= height) continue;
     const idx = y * width + x;
     if (visited[idx]) continue;
-    if (pixels[idx * 4 + 3] === 0) continue; // transparent
+    if (!mask[idx]) continue;
 
     visited[idx] = 1;
     cluster.push(idx);
 
-    stack.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+    stack.push(
+      [x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1],
+      [x + 1, y + 1], [x - 1, y - 1], [x + 1, y - 1], [x - 1, y + 1]
+    );
   }
 
   return cluster;
+}
+
+/**
+ * Create a dilated binary mask from the alpha channel.
+ * Each non-transparent pixel expands by `radius` pixels in all directions.
+ * This bridges small gaps (2-4px) between body parts, wings, and fire
+ * so they register as a single connected component.
+ */
+function dilateMask(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  radius: number
+): Uint8Array {
+  const mask = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (pixels[(y * width + x) * 4 + 3] === 0) continue;
+      // Expand this pixel into a square of side 2*radius+1
+      for (let dy = -radius; dy <= radius; dy++) {
+        for (let dx = -radius; dx <= radius; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            mask[ny * width + nx] = 1;
+          }
+        }
+      }
+    }
+  }
+
+  return mask;
 }
 
 /**
@@ -483,66 +511,61 @@ function removeFragments(
   pixels: Uint8Array,
   width: number,
   height: number,
-  minFraction: number = 0.05
+  _minFraction: number = 0.05
 ): void {
+  // Step 1: Build a DILATED mask — expands each pixel by 6px in all
+  // directions. This bridges gaps up to 12px between body parts, wings,
+  // and fire streams so they form a single connected component. Bleed
+  // fragments from adjacent cells are typically 20+ px away after the
+  // adaptive inset and stay disconnected.
+  const dilated = dilateMask(pixels, width, height, 6);
+
+  // Step 2: Find connected components on the DILATED mask
   const visited = new Uint8Array(width * height);
-  const components: { indices: number[]; cx: number; cy: number }[] = [];
+  const dilatedComponents: number[][] = [];
 
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = y * width + x;
-      if (visited[idx]) continue;
-      if (pixels[idx * 4 + 3] === 0) continue;
-
-      const indices = floodFill(pixels, width, height, x, y, visited);
-      if (indices.length > 0) {
-        // Compute centroid
-        let sumX = 0, sumY = 0;
-        for (const i of indices) {
-          sumX += i % width;
-          sumY += Math.floor(i / width);
-        }
-        components.push({
-          indices,
-          cx: sumX / indices.length,
-          cy: sumY / indices.length,
-        });
-      }
+      if (visited[idx] || !dilated[idx]) continue;
+      const cluster = floodFillMask(dilated, width, height, x, y, visited);
+      if (cluster.length > 0) dilatedComponents.push(cluster);
     }
   }
 
-  if (components.length <= 1) return;
+  if (dilatedComponents.length <= 1) return;
 
-  // Total non-transparent pixel count across all components
-  const totalPixels = components.reduce((s, c) => s + c.indices.length, 0);
+  // Step 3: The largest dilated component is the character + effects.
+  // Map each original non-transparent pixel to its dilated component,
+  // then remove pixels belonging to small dilated components.
+  const largest = Math.max(...dilatedComponents.map(c => c.length));
+  const keepThreshold = Math.max(largest * 0.15, 200);
 
-  // Absolute size floor: anything above this is never removed.
-  // Prevents eating large legitimate content (fire streams, weapons,
-  // effects) that may outgrow the character body.
-  const absoluteFloor = Math.max(totalPixels * 0.08, 300);
+  // Build a label map: pixel index → component index
+  const labels = new Int32Array(width * height).fill(-1);
+  for (let ci = 0; ci < dilatedComponents.length; ci++) {
+    for (const idx of dilatedComponents[ci]) {
+      labels[idx] = ci;
+    }
+  }
 
-  // Edge zone: outer 20% band on each side — bleed comes from adjacent cells
-  const edgeX = width * 0.20;
-  const edgeY = height * 0.20;
+  // Find which dilated components are large enough to keep
+  const keepComponent = new Set<number>();
+  for (let ci = 0; ci < dilatedComponents.length; ci++) {
+    if (dilatedComponents[ci].length >= keepThreshold) {
+      keepComponent.add(ci);
+    }
+  }
 
-  for (const comp of components) {
-    const size = comp.indices.length;
-
-    // Never remove large components — they are real content
-    if (size >= absoluteFloor) continue;
-
-    // Small components: only remove if they are in the edge zone
-    const inEdgeZone =
-      comp.cx < edgeX || comp.cx > width - edgeX ||
-      comp.cy < edgeY || comp.cy > height - edgeY;
-
-    if (inEdgeZone) {
-      for (const idx of comp.indices) {
-        pixels[idx * 4] = 0;
-        pixels[idx * 4 + 1] = 0;
-        pixels[idx * 4 + 2] = 0;
-        pixels[idx * 4 + 3] = 0;
-      }
+  // Remove original pixels whose dilated component is too small
+  for (let idx = 0; idx < width * height; idx++) {
+    if (pixels[idx * 4 + 3] === 0) continue;
+    const label = labels[idx];
+    if (label >= 0 && !keepComponent.has(label)) {
+      pixels[idx * 4] = 0;
+      pixels[idx * 4 + 1] = 0;
+      pixels[idx * 4 + 2] = 0;
+      pixels[idx * 4 + 3] = 0;
     }
   }
 }
@@ -836,7 +859,8 @@ export async function generateSingleSheet(
   const genGrid = pickGenerationGrid(params.frameCount);
   const size = pickSheetSize(genGrid.cols, genGrid.rows);
   const [imgWidth, imgHeight] = size.split("x").map(Number);
-  const totalSteps = 6;
+  // Steps: 1 template + N frames + 1 post-process + 1 quality + 1 done
+  const totalSteps = 1 + params.frameCount + 3;
 
   // Step 1: Create grid template
   onProgress?.("Creating grid template", 1, totalSteps);
@@ -847,61 +871,15 @@ export async function generateSingleSheet(
     genGrid.rows
   );
 
-  const editMask = await createEditMask(
-    imgWidth,
-    imgHeight,
-    genGrid.cols,
-    genGrid.rows
-  );
-
-  // Step 2: Fill grid via edit API
-  onProgress?.("Generating sprite sheet via edit API", 2, totalSteps);
-  const editPrompt = buildEditPrompt(
-    params.prompt,
+  // Step 2-3: Generate each frame individually via per-cell edit API.
+  // Each cell gets its own API call with a mask exposing only that cell.
+  // Content physically cannot bleed into adjacent cells because they are
+  // opaque (preserved) in the mask.
+  const poses = resolveFramePoses(
     params.animation,
     params.frameCount,
-    genGrid.cols,
     params.frameDescriptions
   );
-
-  let sheetBuffer: Buffer;
-  try {
-    sheetBuffer = await generator.editImage(
-      template,
-      editPrompt,
-      {
-        quality: params.quality,
-        size,
-        mask: editMask,
-        background: params.background ?? "transparent",
-      }
-    );
-  } catch {
-    // Fallback: if edit API fails, try direct generation with the old prompt
-    console.error("Edit API failed, falling back to direct generation");
-    const prompt = buildSheetPrompt(
-      params.prompt,
-      params.animation,
-      params.frameCount,
-      genGrid.cols,
-      params.frameDescriptions
-    );
-    const result = await generator.generate({
-      prompt,
-      type: "sprite_sheet",
-      quality: params.quality,
-      background: params.background ?? "transparent",
-      outputDir: params.outputDir,
-      width: imgWidth,
-      height: imgHeight,
-    });
-    const fs = await import("node:fs");
-    sheetBuffer = fs.readFileSync(result.filePath);
-    try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
-  }
-
-  // Step 3: Split into frames with adaptive inset
-  onProgress?.("Splitting frames with adaptive inset", 3, totalSteps);
   const rawFrames: Buffer[] = [];
 
   for (let row = 0; row < genGrid.rows; row++) {
@@ -909,22 +887,71 @@ export async function generateSingleSheet(
       const frameIndex = row * genGrid.cols + col;
       if (frameIndex >= params.frameCount) break;
 
-      const { frame } = await extractFrameAdaptive(
-        sheetBuffer,
-        col * cellWidth,
-        row * cellHeight,
-        cellWidth,
-        cellHeight
+      const step = frameIndex + 2;
+      onProgress?.(
+        `Generating frame ${frameIndex + 1}/${params.frameCount}`,
+        step,
+        totalSteps
       );
-      rawFrames.push(frame);
+
+      // Create a mask that exposes only THIS cell
+      const cellMask = await createSingleCellMask(
+        imgWidth, imgHeight,
+        genGrid.cols, genGrid.rows,
+        col, row
+      );
+
+      const cellPrompt =
+        `Fill cell ${frameIndex + 1} with: ${params.prompt}, ${poses[frameIndex]}. ` +
+        `Center the character within the cell. ` +
+        `Keep the same proportions, colors, and art style as the other cells.`;
+
+      try {
+        const edited = await generator.editImage(
+          template,
+          cellPrompt,
+          {
+            quality: params.quality,
+            size,
+            mask: cellMask,
+            background: params.background ?? "transparent",
+          }
+        );
+
+        // Extract just this cell from the result
+        const frame = await sharp(edited)
+          .extract({
+            left: col * cellWidth,
+            top: row * cellHeight,
+            width: cellWidth,
+            height: cellHeight,
+          })
+          .png()
+          .toBuffer();
+        rawFrames.push(frame);
+      } catch {
+        // Fallback: generate this frame standalone
+        console.error(`Edit API failed for frame ${frameIndex + 1}, generating standalone`);
+        const result = await generator.generate({
+          prompt: `${params.prompt}, ${poses[frameIndex]}, centered on canvas`,
+          type: "game_sprite",
+          quality: params.quality,
+          background: params.background ?? "transparent",
+          outputDir: params.outputDir,
+        });
+        const fs = await import("node:fs");
+        rawFrames.push(fs.readFileSync(result.filePath));
+        try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
+      }
     }
   }
 
-  // Step 4: Position stabilization + transparency cleanup
+  // Post-processing: position stabilization + transparency cleanup
   const skipTrimCenter = params.background === "opaque";
+  const postStep = params.frameCount + 2;
   onProgress?.(
     skipTrimCenter ? "Normalizing frames" : "Stabilizing position and cleaning alpha",
-    4,
+    postStep,
     totalSteps
   );
 
@@ -955,12 +982,24 @@ export async function generateSingleSheet(
       // Strip registration marks
       stripMarksFromPixels(pixels, targetSize, targetSize);
 
+      // Hard border erase: set outermost 6% on all sides to transparent.
+      // After adaptive inset + resize, bleed can extend 25-30px from
+      // the edge of the resized frame. 6% of 512 = ~31px.
+      const borderErase = Math.round(targetSize * 0.06);
+      for (let y = 0; y < targetSize; y++) {
+        for (let x = 0; x < targetSize; x++) {
+          if (y < borderErase || y >= targetSize - borderErase ||
+              x < borderErase || x >= targetSize - borderErase) {
+            const pi = (y * targetSize + x) * 4;
+            pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = pixels[pi + 3] = 0;
+          }
+        }
+      }
+
       // Clean alpha (soft mode for PNG)
       cleanAlpha(pixels, targetSize, targetSize, "soft");
 
-      // Remove small isolated fragments (bleed debris + AI artifacts).
-      // 5% of largest component -- tuned to catch wing-tip fragments while
-      // preserving fire streams that are connected to the character body.
+      // Remove remaining isolated fragments via dilation-based analysis
       removeFragments(pixels, targetSize, targetSize, 0.05);
 
       // Find bounding box center
@@ -1015,15 +1054,18 @@ export async function generateSingleSheet(
     }
   }
 
-  // Step 5: Quality gate
-  onProgress?.("Running quality checks", 5, totalSteps);
+  // Quality gate
+  onProgress?.("Running quality checks", postStep + 1, totalSteps);
   const quality = await runQualityChecks(outputFrames, params.frameCount, targetSize);
 
-  onProgress?.("Frames ready", 6, totalSteps);
+  onProgress?.("Frames ready", postStep + 2, totalSteps);
+
+  // Stitch processed frames into a raw sheet for the return value
+  const rawSheet = await stitchFrames(outputFrames, genGrid.cols, targetSize, targetSize);
 
   return {
     frames: outputFrames,
-    rawSheet: sheetBuffer,
+    rawSheet,
     frameWidth: targetSize,
     frameHeight: targetSize,
     quality,

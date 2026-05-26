@@ -770,9 +770,9 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           frameWidth = 1024;
           frameHeight = 1024;
         } else {
-          // Single-sheet mode (default, best character consistency)
+          // Single-sheet mode (per-cell edit API for clean isolation)
           mode = "single-sheet";
-          apiCalls = 1;
+          apiCalls = frameCount;
           const result = await generateSingleSheet(
             generator,
             {
