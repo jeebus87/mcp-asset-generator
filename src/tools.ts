@@ -797,8 +797,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         } else {
           // Default: hybrid pipeline
           mode = "hybrid";
-          const batchCount = Math.ceil(frameCount / 6);
-          apiCalls = 1 + batchCount; // seed + N strip edits
+          apiCalls = 1; // single generate call + contour extraction
           const result = await generateHybridSheet(
             generator,
             {
@@ -885,7 +884,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           `  API calls: ${apiCalls}`,
           ``,
           mode === "hybrid"
-            ? `Seed frame generated, then edit API produced animation strip with input_fidelity="high".\nFrames extracted by contour detection and normalized with bottom-center anchoring.`
+            ? `All frames generated in a single image for maximum consistency.\nFrames extracted by contour detection and normalized with bottom-center anchoring.`
             : mode === "single-sheet"
             ? `All frames generated in a single image, then split and post-processed.`
             : `Each frame generated individually via edit API.`,

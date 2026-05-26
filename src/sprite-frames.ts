@@ -441,6 +441,18 @@ export async function normalizeFrames(
  *
  * For 7+ frames, generates in batches of 6 (max per strip).
  */
+/**
+ * Hybrid sprite pipeline: single-sheet generation + contour-based extraction.
+ *
+ * One API call generates all frames in a single image (best consistency --
+ * the model sees everything at once in the same context). Frames are then
+ * extracted by finding character blobs via connected component analysis,
+ * not by splitting on grid lines. This makes frame bleed irrelevant.
+ * Finally, frames are normalized to uniform size with bottom-center anchoring.
+ *
+ * This combines the consistency of single-sheet with the bleed immunity
+ * of contour extraction.
+ */
 export async function generateHybridSheet(
   generator: ImageGenerator,
   params: SpriteSheetParams,
@@ -451,136 +463,50 @@ export async function generateHybridSheet(
   frameHeight: number;
   quality?: SpriteQualityMetrics;
 }> {
-  const poses = resolveFramePoses(
+  const genGrid = pickGenerationGrid(params.frameCount);
+  const size = pickSheetSize(genGrid.cols, genGrid.rows);
+  const [imgWidth, imgHeight] = size.split("x").map(Number);
+  const totalSteps = 4;
+
+  // Step 1: Generate all frames in a single API call
+  onProgress?.("Generating sprite sheet (single image)", 1, totalSteps);
+
+  const prompt = buildSheetPrompt(
+    params.prompt,
     params.animation,
     params.frameCount,
+    genGrid.cols,
     params.frameDescriptions
   );
 
-  const MAX_FRAMES_PER_STRIP = 6;
-  const batchCount = Math.ceil(params.frameCount / MAX_FRAMES_PER_STRIP);
-  const totalSteps = 2 + batchCount + 2; // seed + canvas*N + normalize + quality
+  const result = await generator.generate({
+    prompt,
+    type: "sprite_sheet",
+    quality: params.quality,
+    background: params.background ?? "transparent",
+    outputDir: params.outputDir,
+    width: imgWidth,
+    height: imgHeight,
+  });
 
-  // Step 1: Generate seed frame
-  onProgress?.("Generating seed frame", 1, totalSteps);
-  const seedBuffer = await generateSeedFrame(
-    generator,
-    params.prompt,
-    poses[0],
-    {
-      quality: params.quality,
-      background: params.background,
-    }
+  const fs = await import("node:fs");
+  const sheetBuffer = fs.readFileSync(result.filePath);
+  try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
+
+  // Step 2: Extract frames by contour (not grid lines)
+  onProgress?.("Extracting frames by contour detection", 2, totalSteps);
+  const { frames: rawFrames } = await extractFramesByContour(
+    sheetBuffer,
+    params.frameCount
   );
 
-  // Step 2: Generate animation strips in batches
-  const allRawFrames: Buffer[] = [];
-
-  for (let batch = 0; batch < batchCount; batch++) {
-    const batchStart = batch * MAX_FRAMES_PER_STRIP;
-    const batchEnd = Math.min(batchStart + MAX_FRAMES_PER_STRIP, params.frameCount);
-    const batchFrameCount = batchEnd - batchStart;
-    const batchPoses = poses.slice(batchStart, batchEnd);
-
-    // For the first batch, include the seed as frame 1.
-    // For subsequent batches, the seed is still the anchor but all
-    // strip positions are new frames.
-    const stripColumns = batchFrameCount + 1; // seed column + N frame columns
-
-    onProgress?.(
-      `Generating strip ${batch + 1}/${batchCount} (frames ${batchStart + 1}-${batchEnd})`,
-      2 + batch,
-      totalSteps
-    );
-
-    // Build canvas with seed at position 0
-    const { canvas } = await buildEditCanvas(seedBuffer, stripColumns);
-    const mask = await buildStripMask(stripColumns);
-
-    // Build the edit prompt -- repeat the full character description to anchor
-    // consistency. Research shows describing the full desired output (not just
-    // the change) produces much better results with the edit API.
-    const poseList = batchPoses
-      .map((pose, i) => `Frame ${i + 1}: ${pose}`)
-      .join(". ");
-
-    // Prompt uses explicit image role labels -- Image 1 is the character
-    // reference (passed via referenceImages for highest fidelity), Image 2
-    // is the strip canvas to fill.
-    const editPrompt =
-      `Image 1 is the character reference. This is the character's canonical design -- do not redesign it. ` +
-      `Image 2 is the animation strip canvas. Generate ${batchFrameCount} animation frames in Image 2, ` +
-      `to the right of the reference position. ` +
-      `CRITICAL: Every frame must show the EXACT character from Image 1 -- ` +
-      `same body shape, same proportions, same colors, same art style, ` +
-      `same size, same outline thickness, same level of detail. ` +
-      `The character is: ${params.prompt}. ` +
-      `The ONLY difference between frames is the pose. ` +
-      `${poseList}. ` +
-      `Keep each frame separated by empty space. Center the character in each position. ` +
-      `Do not change the character's design, color palette, or art style in any frame.`;
-
-    let stripResult: Buffer;
-    try {
-      stripResult = await generator.editImage(
-        canvas,
-        editPrompt,
-        {
-          quality: params.quality,
-          size: "1536x1024",
-          mask,
-          background: params.background ?? "transparent",
-          inputFidelity: "high",
-          model: "gpt-image-1",
-          referenceImages: [seedBuffer],
-        }
-      );
-    } catch (error) {
-      // Fallback: generate each frame standalone
-      console.error(`Strip generation failed for batch ${batch + 1}, falling back to per-frame`);
-      for (const pose of batchPoses) {
-        const fb = await generateSeedFrame(generator, params.prompt, pose, {
-          quality: params.quality,
-          background: params.background,
-        });
-        allRawFrames.push(fb);
-      }
-      continue;
-    }
-
-    // Extract frames from the strip result via contour detection
-    // Skip the first blob (that's the seed) -- we only want the new frames
-    const { frames: extractedFrames } = await extractFramesByContour(
-      stripResult,
-      batchFrameCount + 1 // include seed blob in expected count
-    );
-
-    // Skip the first frame (seed) and take the rest
-    const newFrames = extractedFrames.slice(1);
-    allRawFrames.push(...newFrames);
-
-    // If contour extraction found fewer frames than expected,
-    // fall back to generating the missing frames standalone
-    const missing = batchFrameCount - newFrames.length;
-    if (missing > 0) {
-      console.error(`Contour extraction found ${newFrames.length}/${batchFrameCount} frames, generating ${missing} standalone`);
-      for (let i = newFrames.length; i < batchFrameCount; i++) {
-        const fb = await generateSeedFrame(generator, params.prompt, batchPoses[i], {
-          quality: params.quality,
-          background: params.background,
-        });
-        allRawFrames.push(fb);
-      }
-    }
-  }
-
-  // Step 3: Normalize all frames
-  onProgress?.("Normalizing frames", 2 + batchCount, totalSteps);
-  const targetSize = 512; // output frame size
-  const normalizedFrames = await normalizeFrames(allRawFrames, targetSize, "soft");
+  // Step 3: Normalize all frames (bottom-center anchor, uniform size)
+  onProgress?.("Normalizing frames", 3, totalSteps);
+  const targetSize = 512;
+  const normalizedFrames = await normalizeFrames(rawFrames, targetSize, "soft");
 
   // Step 4: Quality gate
-  onProgress?.("Running quality checks", 2 + batchCount + 1, totalSteps);
+  onProgress?.("Running quality checks", 4, totalSteps);
   const quality = await runQualityChecks(normalizedFrames, params.frameCount, targetSize);
 
   onProgress?.("Frames ready", totalSteps, totalSteps);
