@@ -11,18 +11,11 @@ async function main() {
   // Load .env file (if present) before reading config
   dotenvConfig();
 
-  // Load and validate configuration
+  // Load configuration (API key may arrive later via .env)
   const config = loadConfig();
 
-  // Create generator and validate API key
+  // Create generator (connects to OpenAI lazily on first tool call)
   const generator = new ImageGenerator(config);
-  try {
-    await generator.validateApiKey();
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(`API key validation failed:\n${message}`);
-    process.exit(1);
-  }
 
   // Create MCP server
   const server = new McpServer({

@@ -24,6 +24,7 @@ import {
   generateFrames,
   generateSingleSheet,
   stitchFrames,
+  cleanFramesForGif,
 } from "./sprite-frames.js";
 import { createAnimatedGif } from "./gif.js";
 
@@ -744,6 +745,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         let frameHeight: number;
         let apiCalls: number;
         let mode: string;
+        let qualityMetrics: import("./sprite-frames.js").SpriteQualityMetrics | undefined;
 
         if (usePerFrame) {
           // Per-frame edit mode (legacy, more distinct poses but less consistency)
@@ -789,6 +791,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           frameBuffers = result.frames;
           frameWidth = result.frameWidth;
           frameHeight = result.frameHeight;
+          qualityMetrics = result.quality;
         }
 
         // Stitch frames into clean grid
@@ -815,7 +818,7 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
         const sheetWidth = columns * frameWidth;
         const sheetHeight = rows * frameHeight;
 
-        // Generate animated GIF preview
+        // Generate animated GIF preview (with binary alpha cleanup for GIF)
         let gifPath: string | null = null;
         if (wantGif) {
           await sendProgress("Creating animated GIF preview", saveStep + 1, totalSteps);
@@ -832,7 +835,10 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
             };
           }
 
-          const gifBuffer = await createAnimatedGif(frameBuffers, frameWidth, frameHeight, fps, {
+          // Apply binary alpha cleanup for GIF (GIF only supports on/off transparency)
+          const gifFrames = await cleanFramesForGif(frameBuffers);
+
+          const gifBuffer = await createAnimatedGif(gifFrames, frameWidth, frameHeight, fps, {
             background: gifBg,
           });
           gifPath = filePath.replace(/\.png$/, ".gif");
@@ -855,9 +861,17 @@ export function registerTools(server: McpServer, generator: ImageGenerator) {
           `  API calls: ${apiCalls}`,
           ``,
           mode === "single-sheet"
-            ? `All frames generated in a single image for maximum character consistency,\nthen split and centered into individual frames.`
+            ? `All frames generated via grid template + edit API for clean frame isolation,\nthen split, centered, and alpha-cleaned into individual frames.`
             : `Each frame generated individually via edit API for maximum pose variety.`,
         );
+
+        // Append quality gate warnings if any
+        if (qualityMetrics && qualityMetrics.warnings.length > 0) {
+          output.push(``, `Quality warnings:`);
+          for (const w of qualityMetrics.warnings) {
+            output.push(`  - ${w}`);
+          }
+        }
 
         return {
           content: [

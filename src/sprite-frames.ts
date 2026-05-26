@@ -77,14 +77,184 @@ export interface SpriteSheetParams {
   maskPreserve?: number;
 }
 
+/** Quality metrics returned from sprite sheet generation */
+export interface SpriteQualityMetrics {
+  edgeBleedScore: number;     // 0-1, lower is better (fraction of edge pixels with content)
+  positionVariance: number;   // 0-1, lower is better (normalized center variance)
+  alphaClean: boolean;        // true if no dirty alpha pixels remain
+  frameCountMatch: boolean;   // true if extracted frames == requested frames
+  warnings: string[];         // human-readable quality warnings
+}
+
+// ---------------------------------------------------------------------------
+// Registration mark color and detection
+// ---------------------------------------------------------------------------
+
+/** Registration mark color: pure magenta, easy to detect and unlikely in game art */
+const MARK_COLOR = { r: 255, g: 0, b: 255 };
+const MARK_SIZE = 6; // L-shape arm length in pixels
+const MARK_THICKNESS = 2;
+const BORDER_THICKNESS = 2;
+
+// ---------------------------------------------------------------------------
+// Grid template creation
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a grid template image with cell borders, numbered labels, and
+ * L-shaped corner registration marks. The AI sees this structure when
+ * filling cells via the edit API.
+ */
+async function createGridTemplate(
+  width: number,
+  height: number,
+  columns: number,
+  rows: number
+): Promise<{ template: Buffer; cellWidth: number; cellHeight: number }> {
+  const cellWidth = Math.floor(width / columns);
+  const cellHeight = Math.floor(height / rows);
+
+  // Build SVG with borders, numbers, and registration marks
+  const svgParts: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">`,
+    // Light gray background so the AI sees the grid clearly
+    `<rect width="${width}" height="${height}" fill="#e0e0e0"/>`,
+  ];
+
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < columns; col++) {
+      const cellIndex = row * columns + col;
+      const x = col * cellWidth;
+      const y = row * cellHeight;
+
+      // Cell border
+      svgParts.push(
+        `<rect x="${x}" y="${y}" width="${cellWidth}" height="${cellHeight}" ` +
+        `fill="none" stroke="#333333" stroke-width="${BORDER_THICKNESS}"/>`
+      );
+
+      // Cell number label (centered, semi-transparent so AI draws over it)
+      const labelX = x + cellWidth / 2;
+      const labelY = y + cellHeight / 2;
+      svgParts.push(
+        `<text x="${labelX}" y="${labelY}" text-anchor="middle" dominant-baseline="central" ` +
+        `font-family="Arial,sans-serif" font-size="${Math.min(cellWidth, cellHeight) * 0.3}" ` +
+        `fill="rgba(100,100,100,0.4)" font-weight="bold">${cellIndex + 1}</text>`
+      );
+
+      // L-shaped corner registration marks (magenta)
+      const markColor = `rgb(${MARK_COLOR.r},${MARK_COLOR.g},${MARK_COLOR.b})`;
+
+      // Top-left corner mark
+      svgParts.push(
+        `<rect x="${x}" y="${y}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
+        `<rect x="${x}" y="${y}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
+      );
+
+      // Top-right corner mark
+      svgParts.push(
+        `<rect x="${x + cellWidth - MARK_SIZE}" y="${y}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
+        `<rect x="${x + cellWidth - MARK_THICKNESS}" y="${y}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
+      );
+
+      // Bottom-left corner mark
+      svgParts.push(
+        `<rect x="${x}" y="${y + cellHeight - MARK_THICKNESS}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
+        `<rect x="${x}" y="${y + cellHeight - MARK_SIZE}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
+      );
+
+      // Bottom-right corner mark
+      svgParts.push(
+        `<rect x="${x + cellWidth - MARK_SIZE}" y="${y + cellHeight - MARK_THICKNESS}" width="${MARK_SIZE}" height="${MARK_THICKNESS}" fill="${markColor}"/>`,
+        `<rect x="${x + cellWidth - MARK_THICKNESS}" y="${y + cellHeight - MARK_SIZE}" width="${MARK_THICKNESS}" height="${MARK_SIZE}" fill="${markColor}"/>`
+      );
+    }
+  }
+
+  svgParts.push(`</svg>`);
+
+  const template = await sharp(Buffer.from(svgParts.join("\n")))
+    .resize(width, height)
+    .png()
+    .toBuffer();
+
+  return { template, cellWidth, cellHeight };
+}
+
+/**
+ * Create a mask for the edit API. Transparent (alpha=0) areas are editable,
+ * opaque areas are preserved. We make all cell interiors transparent so the
+ * AI can fill them, and keep borders/marks opaque.
+ */
+async function createEditMask(
+  width: number,
+  height: number,
+  columns: number,
+  rows: number
+): Promise<Buffer> {
+  const cellWidth = Math.floor(width / columns);
+  const cellHeight = Math.floor(height / rows);
+  const inset = BORDER_THICKNESS + MARK_SIZE + 2; // clear of borders and marks
+
+  const svgParts: string[] = [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">`,
+    // Start fully opaque (black = preserve)
+    `<rect width="${width}" height="${height}" fill="black"/>`,
+  ];
+
+  // Cut out cell interiors (transparent = editable)
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < columns; col++) {
+      const x = col * cellWidth + inset;
+      const y = row * cellHeight + inset;
+      const w = cellWidth - inset * 2;
+      const h = cellHeight - inset * 2;
+      svgParts.push(
+        `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="black" fill-opacity="0"/>`
+      );
+    }
+  }
+
+  svgParts.push(`</svg>`);
+
+  return sharp(Buffer.from(svgParts.join("\n")))
+    .resize(width, height)
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Build the prompt for the edit API when filling the grid template.
+ */
+function buildEditPrompt(
+  baseDescription: string,
+  animation: string,
+  frameCount: number,
+  columns: number,
+  customDescriptions?: string[]
+): string {
+  const poses = resolveFramePoses(animation, frameCount, customDescriptions);
+
+  const frameList = poses
+    .map((pose, i) => `Cell ${i + 1}: ${pose}`)
+    .join(". ");
+
+  return (
+    `Fill each numbered cell in this grid with: ${baseDescription}. ` +
+    `Each cell shows a different frame of a ${animation} animation. ` +
+    `${frameList}. ` +
+    `Center the character within each cell. ` +
+    `Keep the same character, proportions, colors, and art style in every cell. ` +
+    `Do not draw outside the cell borders. Keep the grid lines and corner marks visible.`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Single-sheet generation (default, best consistency)
 // ---------------------------------------------------------------------------
 
 /**
- * Build the prompt for single-sheet sprite generation.
- * All frames are generated in one API call so the model maintains character
- * consistency across the entire sheet.
+ * Build the prompt for single-sheet sprite generation (legacy fallback).
  */
 export function buildSheetPrompt(
   baseDescription: string,
@@ -95,8 +265,6 @@ export function buildSheetPrompt(
 ): string {
   const rows = Math.ceil(frameCount / columns);
   const poses = resolveFramePoses(animation, frameCount, customDescriptions);
-
-  // Build per-frame descriptions for the grid
   const frameList = poses.map((pose, i) => `Frame ${i + 1}: ${pose}`).join(". ");
 
   const gridDesc = rows === 1
@@ -105,8 +273,8 @@ export function buildSheetPrompt(
 
   return (
     `A sprite sheet with exactly ${gridDesc}. ` +
-    `Each frame is separated by bright solid green (#00FF00) divider lines. ` +
-    `Nothing may cross or overlap the green divider lines -- all content must stay fully inside its own cell. ` +
+    `Each frame is completely self-contained -- nothing may cross into an adjacent frame or touch the edges of any cell. ` +
+    `There must be clear empty space between every frame. ` +
     `Each frame shows the same scene: ${baseDescription}. ` +
     `The frames show a ${animation} animation sequence. ` +
     `${frameList}. ` +
@@ -125,8 +293,8 @@ function pickSheetSize(
   columns: number,
   rows: number
 ): "1024x1024" | "1536x1024" | "1024x1536" {
-  if (rows === 1 && columns > 2) return "1536x1024"; // wide strip
-  if (columns === 1 && rows > 2) return "1024x1536"; // tall strip
+  if (rows === 1 && columns > 2) return "1536x1024";
+  if (columns === 1 && rows > 2) return "1024x1536";
   if (columns > rows) return "1536x1024";
   if (rows > columns) return "1024x1536";
   return "1024x1024";
@@ -134,39 +302,448 @@ function pickSheetSize(
 
 /**
  * Choose an internal grid layout that maximizes per-frame resolution.
- * The user's `columns` param controls the output sheet layout; this
- * picks the best generation grid for the API's fixed image sizes.
  */
 function pickGenerationGrid(frameCount: number): { cols: number; rows: number } {
-  // For a 1536x1024 canvas, prefer wider layouts (more cols)
-  // For a 1024x1536 canvas, prefer taller layouts (more rows)
-  // For 1024x1024, prefer square-ish grids
   if (frameCount <= 2) return { cols: 2, rows: 1 };
   if (frameCount <= 4) return { cols: 2, rows: 2 };
   if (frameCount <= 6) return { cols: 3, rows: 2 };
   if (frameCount <= 8) return { cols: 4, rows: 2 };
   if (frameCount <= 12) return { cols: 4, rows: 3 };
-  return { cols: 4, rows: 4 }; // up to 16
+  return { cols: 4, rows: 4 };
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive inset: start small, increase if bleed detected
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if a frame has content bleeding at its edges.
+ * Returns the fraction of edge pixels that are non-transparent.
+ */
+function measureEdgeBleed(pixels: Uint8Array, width: number, height: number): number {
+  let edgePixels = 0;
+  let contentPixels = 0;
+
+  // Check top and bottom rows
+  for (let x = 0; x < width; x++) {
+    // Top row
+    if (pixels[(0 * width + x) * 4 + 3] > 0) contentPixels++;
+    edgePixels++;
+    // Bottom row
+    if (pixels[((height - 1) * width + x) * 4 + 3] > 0) contentPixels++;
+    edgePixels++;
+  }
+
+  // Check left and right columns (excluding corners already counted)
+  for (let y = 1; y < height - 1; y++) {
+    // Left column
+    if (pixels[(y * width + 0) * 4 + 3] > 0) contentPixels++;
+    edgePixels++;
+    // Right column
+    if (pixels[(y * width + (width - 1)) * 4 + 3] > 0) contentPixels++;
+    edgePixels++;
+  }
+
+  return edgePixels > 0 ? contentPixels / edgePixels : 0;
 }
 
 /**
- * Generate a complete sprite sheet in a single API call, then split into
- * individual frames. The model generates all frames at once, which inherently
- * maintains character consistency since everything is in one image.
+ * Extract a frame from a sheet with adaptive inset.
+ * Starts at 3% inset, increases if >5% of edge pixels have content (bleed).
+ */
+async function extractFrameAdaptive(
+  sheetBuffer: Buffer,
+  cellX: number,
+  cellY: number,
+  cellWidth: number,
+  cellHeight: number
+): Promise<{ frame: Buffer; insetUsed: number }> {
+  const INSET_STEPS = [0.03, 0.05, 0.07, 0.10, 0.12];
+  const BLEED_THRESHOLD = 0.05; // >5% edge content = bleed
+
+  for (const insetFrac of INSET_STEPS) {
+    const insetX = Math.round(cellWidth * insetFrac);
+    const insetY = Math.round(cellHeight * insetFrac);
+
+    const extractLeft = cellX + insetX;
+    const extractTop = cellY + insetY;
+    const extractWidth = cellWidth - insetX * 2;
+    const extractHeight = cellHeight - insetY * 2;
+
+    if (extractWidth <= 0 || extractHeight <= 0) continue;
+
+    const frameRaw = await sharp(sheetBuffer)
+      .extract({
+        left: extractLeft,
+        top: extractTop,
+        width: extractWidth,
+        height: extractHeight,
+      })
+      .ensureAlpha()
+      .raw()
+      .toBuffer();
+
+    const bleed = measureEdgeBleed(
+      new Uint8Array(frameRaw.buffer, frameRaw.byteOffset, frameRaw.byteLength),
+      extractWidth,
+      extractHeight
+    );
+
+    if (bleed <= BLEED_THRESHOLD) {
+      // Clean enough, use this inset
+      const frame = await sharp(sheetBuffer)
+        .extract({
+          left: extractLeft,
+          top: extractTop,
+          width: extractWidth,
+          height: extractHeight,
+        })
+        .png()
+        .toBuffer();
+      return { frame, insetUsed: insetFrac };
+    }
+  }
+
+  // Fallback: use the largest inset
+  const maxInset = INSET_STEPS[INSET_STEPS.length - 1];
+  const insetX = Math.round(cellWidth * maxInset);
+  const insetY = Math.round(cellHeight * maxInset);
+  const frame = await sharp(sheetBuffer)
+    .extract({
+      left: cellX + insetX,
+      top: cellY + insetY,
+      width: cellWidth - insetX * 2,
+      height: cellHeight - insetY * 2,
+    })
+    .png()
+    .toBuffer();
+  return { frame, insetUsed: maxInset };
+}
+
+// ---------------------------------------------------------------------------
+// Strip registration marks from frame pixels
+// ---------------------------------------------------------------------------
+
+function stripMarksFromPixels(pixels: Uint8Array, _width: number, _height: number): void {
+  for (let i = 0; i < pixels.length; i += 4) {
+    const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+    // Detect magenta registration marks (allow some tolerance)
+    if (r > 200 && g < 50 && b > 200) {
+      pixels[i + 3] = 0; // make transparent
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Premultiplied alpha correction for fringe removal
+// ---------------------------------------------------------------------------
+
+/**
+ * Apply premultiplied alpha correction to remove color fringing.
+ * Semi-transparent pixels often carry blended background color data.
+ * Unpremultiplying and re-premultiplying removes the fringe mathematically.
+ *
+ * mode="soft" preserves anti-aliasing (for PNG sprite sheets)
+ * mode="binary" snaps all alpha to 0 or 255 (for GIF)
+ */
+function cleanAlpha(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  mode: "soft" | "binary"
+): void {
+  const softLow = 20;   // alpha below this -> transparent
+  const softHigh = 235;  // alpha above this -> opaque
+  const binaryThreshold = 128;
+
+  for (let i = 0; i < pixels.length; i += 4) {
+    const a = pixels[i + 3];
+
+    if (a === 0 || a === 255) continue; // already clean
+
+    if (mode === "binary") {
+      pixels[i + 3] = a >= binaryThreshold ? 255 : 0;
+      if (pixels[i + 3] === 0) {
+        pixels[i] = pixels[i + 1] = pixels[i + 2] = 0;
+      }
+      continue;
+    }
+
+    // Soft mode: snap near-edges and apply premultiplied alpha correction
+    if (a < softLow) {
+      pixels[i] = pixels[i + 1] = pixels[i + 2] = pixels[i + 3] = 0;
+      continue;
+    }
+    if (a > softHigh) {
+      pixels[i + 3] = 255;
+      continue;
+    }
+
+    // Premultiplied alpha correction: unpremultiply to remove fringe
+    const alphaF = a / 255;
+    pixels[i] = Math.min(255, Math.round(pixels[i] / alphaF));       // R
+    pixels[i + 1] = Math.min(255, Math.round(pixels[i + 1] / alphaF)); // G
+    pixels[i + 2] = Math.min(255, Math.round(pixels[i + 2] / alphaF)); // B
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Opaque background color consistency check
+// ---------------------------------------------------------------------------
+
+/**
+ * Sample the background color from corners of each frame and normalize
+ * to the most common value to prevent flicker.
+ */
+async function normalizeOpaqueBackground(
+  frameBuffers: Buffer[],
+  targetSize: number
+): Promise<Buffer[]> {
+  // Sample corner colors from each frame
+  const bgSamples: { r: number; g: number; b: number }[] = [];
+
+  for (const buf of frameBuffers) {
+    const raw = await sharp(buf)
+      .resize(targetSize, targetSize, { fit: "cover" })
+      .raw()
+      .toBuffer();
+
+    const pixels = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+
+    // Sample 4 corners (10px in from edge)
+    const sampleOffset = 10;
+    const corners = [
+      (sampleOffset * targetSize + sampleOffset) * 4,
+      (sampleOffset * targetSize + (targetSize - sampleOffset)) * 4,
+      ((targetSize - sampleOffset) * targetSize + sampleOffset) * 4,
+      ((targetSize - sampleOffset) * targetSize + (targetSize - sampleOffset)) * 4,
+    ];
+
+    let rSum = 0, gSum = 0, bSum = 0, count = 0;
+    for (const idx of corners) {
+      if (idx + 2 < pixels.length) {
+        rSum += pixels[idx];
+        gSum += pixels[idx + 1];
+        bSum += pixels[idx + 2];
+        count++;
+      }
+    }
+    if (count > 0) {
+      bgSamples.push({
+        r: Math.round(rSum / count),
+        g: Math.round(gSum / count),
+        b: Math.round(bSum / count),
+      });
+    }
+  }
+
+  // Find the median background color
+  if (bgSamples.length === 0) return frameBuffers;
+
+  const medR = median(bgSamples.map(s => s.r));
+  const medG = median(bgSamples.map(s => s.g));
+  const medB = median(bgSamples.map(s => s.b));
+
+  // Check if any frame's background differs significantly
+  const threshold = 15;
+  const needsNormalization = bgSamples.some(s =>
+    Math.abs(s.r - medR) > threshold ||
+    Math.abs(s.g - medG) > threshold ||
+    Math.abs(s.b - medB) > threshold
+  );
+
+  if (!needsNormalization) return frameBuffers;
+
+  // Normalize: for frames with drifted backgrounds, tint the corners
+  const output: Buffer[] = [];
+  for (let i = 0; i < frameBuffers.length; i++) {
+    const diff = bgSamples[i];
+    if (
+      Math.abs(diff.r - medR) > threshold ||
+      Math.abs(diff.g - medG) > threshold ||
+      Math.abs(diff.b - medB) > threshold
+    ) {
+      // Apply a subtle color correction overlay
+      const tintSvg = Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg" width="${targetSize}" height="${targetSize}">` +
+        `<rect width="${targetSize}" height="${targetSize}" fill="rgb(${medR},${medG},${medB})" opacity="0.15"/>` +
+        `</svg>`
+      );
+      const corrected = await sharp(frameBuffers[i])
+        .resize(targetSize, targetSize, { fit: "cover" })
+        .composite([{ input: tintSvg, blend: "over" }])
+        .png()
+        .toBuffer();
+      output.push(corrected);
+    } else {
+      output.push(
+        await sharp(frameBuffers[i])
+          .resize(targetSize, targetSize, { fit: "cover" })
+          .png()
+          .toBuffer()
+      );
+    }
+  }
+  return output;
+}
+
+function median(arr: number[]): number {
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+}
+
+// ---------------------------------------------------------------------------
+// Quality gate checks
+// ---------------------------------------------------------------------------
+
+/**
+ * Run automated quality checks on generated sprite sheet frames.
+ */
+export async function runQualityChecks(
+  frameBuffers: Buffer[],
+  requestedFrameCount: number,
+  targetSize: number
+): Promise<SpriteQualityMetrics> {
+  const warnings: string[] = [];
+
+  // Check 1: Frame count
+  const frameCountMatch = frameBuffers.length === requestedFrameCount;
+  if (!frameCountMatch) {
+    warnings.push(
+      `Frame count mismatch: got ${frameBuffers.length}, expected ${requestedFrameCount}`
+    );
+  }
+
+  // Check 2-4: Per-frame analysis
+  let totalEdgeBleed = 0;
+  const centers: { cx: number; cy: number }[] = [];
+  let dirtyAlphaCount = 0;
+
+  for (const buf of frameBuffers) {
+    const raw = await sharp(buf)
+      .resize(targetSize, targetSize, {
+        fit: "contain",
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      })
+      .ensureAlpha()
+      .raw()
+      .toBuffer();
+
+    const pixels = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+
+    // Edge bleed
+    totalEdgeBleed += measureEdgeBleed(pixels, targetSize, targetSize);
+
+    // Bounding box center
+    let left = targetSize, top = targetSize, right = 0, bottom = 0;
+    for (let y = 0; y < targetSize; y++) {
+      for (let x = 0; x < targetSize; x++) {
+        if (pixels[(y * targetSize + x) * 4 + 3] > 0) {
+          left = Math.min(left, x);
+          top = Math.min(top, y);
+          right = Math.max(right, x);
+          bottom = Math.max(bottom, y);
+        }
+      }
+    }
+    centers.push({ cx: (left + right) / 2, cy: (top + bottom) / 2 });
+
+    // Dirty alpha check
+    for (let i = 0; i < pixels.length; i += 4) {
+      const a = pixels[i + 3];
+      if (a > 0 && a < 20) dirtyAlphaCount++;
+      if (a > 235 && a < 255) dirtyAlphaCount++;
+    }
+  }
+
+  const edgeBleedScore = frameBuffers.length > 0
+    ? totalEdgeBleed / frameBuffers.length
+    : 0;
+
+  // Position variance: normalized standard deviation of centers
+  let positionVariance = 0;
+  if (centers.length > 1) {
+    const avgCx = centers.reduce((s, c) => s + c.cx, 0) / centers.length;
+    const avgCy = centers.reduce((s, c) => s + c.cy, 0) / centers.length;
+    const variance = centers.reduce(
+      (s, c) => s + (c.cx - avgCx) ** 2 + (c.cy - avgCy) ** 2,
+      0
+    ) / centers.length;
+    positionVariance = Math.sqrt(variance) / targetSize;
+  }
+
+  const alphaClean = dirtyAlphaCount === 0;
+
+  // Generate warnings
+  if (edgeBleedScore > 0.05) {
+    warnings.push(
+      `Edge bleed detected: ${(edgeBleedScore * 100).toFixed(1)}% of edge pixels have content`
+    );
+  }
+  if (positionVariance > 0.05) {
+    warnings.push(
+      `Position drift detected: ${(positionVariance * 100).toFixed(1)}% variance`
+    );
+  }
+  if (!alphaClean) {
+    warnings.push(`Dirty alpha pixels found: ${dirtyAlphaCount} pixels in transitional range`);
+  }
+
+  return {
+    edgeBleedScore,
+    positionVariance,
+    alphaClean,
+    frameCountMatch,
+    warnings,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main generation pipeline
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a complete sprite sheet using the grid template + edit API approach.
+ * Creates a numbered grid template, uses the edit API to fill each cell,
+ * then post-processes with adaptive inset, position stabilization, and
+ * premultiplied alpha correction.
  */
 export async function generateSingleSheet(
   generator: ImageGenerator,
   params: SpriteSheetParams,
   onProgress?: (step: string, progress: number, total: number) => void
-): Promise<{ frames: Buffer[]; rawSheet: Buffer; frameWidth: number; frameHeight: number }> {
-  // Use an internal grid optimized for resolution, not the user's output columns
+): Promise<{
+  frames: Buffer[];
+  rawSheet: Buffer;
+  frameWidth: number;
+  frameHeight: number;
+  quality?: SpriteQualityMetrics;
+}> {
   const genGrid = pickGenerationGrid(params.frameCount);
-  const totalSteps = 4; // generate + split + center + done
+  const size = pickSheetSize(genGrid.cols, genGrid.rows);
+  const [imgWidth, imgHeight] = size.split("x").map(Number);
+  const totalSteps = 6;
 
-  // Step 1: Generate the full sheet in one call
-  onProgress?.("Generating sprite sheet (single image)", 1, totalSteps);
+  // Step 1: Create grid template
+  onProgress?.("Creating grid template", 1, totalSteps);
+  const { template, cellWidth, cellHeight } = await createGridTemplate(
+    imgWidth,
+    imgHeight,
+    genGrid.cols,
+    genGrid.rows
+  );
 
-  const prompt = buildSheetPrompt(
+  const editMask = await createEditMask(
+    imgWidth,
+    imgHeight,
+    genGrid.cols,
+    genGrid.rows
+  );
+
+  // Step 2: Fill grid via edit API
+  onProgress?.("Generating sprite sheet via edit API", 2, totalSteps);
+  const editPrompt = buildEditPrompt(
     params.prompt,
     params.animation,
     params.frameCount,
@@ -174,78 +751,83 @@ export async function generateSingleSheet(
     params.frameDescriptions
   );
 
-  const size = pickSheetSize(genGrid.cols, genGrid.rows);
-  const result = await generator.generate({
-    prompt,
-    type: "sprite_sheet",
-    quality: params.quality,
-    background: params.background ?? "transparent",
-    outputDir: params.outputDir,
-    width: parseInt(size.split("x")[0]),
-    height: parseInt(size.split("x")[1]),
-  });
-
-  const fs = await import("node:fs");
-  const sheetBuffer = fs.readFileSync(result.filePath);
-
+  let sheetBuffer: Buffer;
   try {
-    fs.unlinkSync(result.filePath);
+    sheetBuffer = await generator.editImage(
+      template,
+      editPrompt,
+      {
+        quality: params.quality,
+        size,
+        mask: editMask,
+        background: params.background ?? "transparent",
+      }
+    );
   } catch {
-    // Non-critical
+    // Fallback: if edit API fails, try direct generation with the old prompt
+    console.error("Edit API failed, falling back to direct generation");
+    const prompt = buildSheetPrompt(
+      params.prompt,
+      params.animation,
+      params.frameCount,
+      genGrid.cols,
+      params.frameDescriptions
+    );
+    const result = await generator.generate({
+      prompt,
+      type: "sprite_sheet",
+      quality: params.quality,
+      background: params.background ?? "transparent",
+      outputDir: params.outputDir,
+      width: imgWidth,
+      height: imgHeight,
+    });
+    const fs = await import("node:fs");
+    sheetBuffer = fs.readFileSync(result.filePath);
+    try { fs.unlinkSync(result.filePath); } catch { /* non-critical */ }
   }
 
-  // Step 2: Split into grid cells
-  onProgress?.("Splitting into individual frames", 2, totalSteps);
-
-  const cellWidth = Math.floor(result.width / genGrid.cols);
-  const cellHeight = Math.floor(result.height / genGrid.rows);
+  // Step 3: Split into frames with adaptive inset
+  onProgress?.("Splitting frames with adaptive inset", 3, totalSteps);
   const rawFrames: Buffer[] = [];
-
-  // Inset each cell by 5% to strip the green divider lines we asked the AI
-  // to draw (which keep content inside cell boundaries) plus any remaining bleed.
-  const insetX = Math.round(cellWidth * 0.05);
-  const insetY = Math.round(cellHeight * 0.05);
 
   for (let row = 0; row < genGrid.rows; row++) {
     for (let col = 0; col < genGrid.cols; col++) {
       const frameIndex = row * genGrid.cols + col;
       if (frameIndex >= params.frameCount) break;
 
-      const frame = await sharp(sheetBuffer)
-        .extract({
-          left: col * cellWidth + insetX,
-          top: row * cellHeight + insetY,
-          width: cellWidth - insetX * 2,
-          height: cellHeight - insetY * 2,
-        })
-        .png()
-        .toBuffer();
+      const { frame } = await extractFrameAdaptive(
+        sheetBuffer,
+        col * cellWidth,
+        row * cellHeight,
+        cellWidth,
+        cellHeight
+      );
       rawFrames.push(frame);
     }
   }
 
-  // Step 3: Normalize frames
-  // For transparent backgrounds: trim to bounding box and re-center (good for characters)
-  // For opaque backgrounds: skip trim/center to keep frames pixel-aligned (good for scenes)
+  // Step 4: Position stabilization + transparency cleanup
   const skipTrimCenter = params.background === "opaque";
-  onProgress?.(skipTrimCenter ? "Normalizing frames" : "Centering and normalizing frames", 3, totalSteps);
+  onProgress?.(
+    skipTrimCenter ? "Normalizing frames" : "Stabilizing position and cleaning alpha",
+    4,
+    totalSteps
+  );
 
   const targetSize = Math.max(cellWidth, cellHeight);
   const outputFrames: Buffer[] = [];
 
   if (skipTrimCenter) {
-    // Opaque: resize raw grid cells to square, cropping to cover the canvas
-    for (const frame of rawFrames) {
-      const resized = await sharp(frame)
-        .resize(targetSize, targetSize, { fit: "cover" })
-        .png()
-        .toBuffer();
-      outputFrames.push(resized);
-    }
+    // Opaque: normalize background color consistency
+    const normalized = await normalizeOpaqueBackground(rawFrames, targetSize);
+    outputFrames.push(...normalized);
   } else {
-    // Transparent: resize to square and clean up edge artifacts.
-    // Position consistency comes from the AI's single-sheet generation
-    // and the green grid lines in the prompt -- no post-processing shifts needed.
+    // Transparent: resize, strip marks, clean alpha, stabilize position
+
+    // Pass 1: process each frame individually
+    const processed: { buffer: Buffer; cx: number; cy: number }[] = [];
+
     for (const frame of rawFrames) {
       const resized = await sharp(frame)
         .resize(targetSize, targetSize, {
@@ -255,30 +837,78 @@ export async function generateSingleSheet(
         .raw()
         .toBuffer();
 
-      // Remove white fringing: semi-transparent near-white pixels at edges
-      const pixels = new Uint8Array(resized);
-      for (let i = 0; i < pixels.length; i += 4) {
-        const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2], a = pixels[i + 3];
-        if (a > 0 && a < 128 && r > 200 && g > 200 && b > 200) {
-          pixels[i + 3] = 0;
+      const pixels = new Uint8Array(resized.buffer, resized.byteOffset, resized.byteLength);
+
+      // Strip registration marks
+      stripMarksFromPixels(pixels, targetSize, targetSize);
+
+      // Clean alpha (soft mode for PNG)
+      cleanAlpha(pixels, targetSize, targetSize, "soft");
+
+      // Find bounding box center
+      let left = targetSize, top = targetSize, right = 0, bottom = 0;
+      for (let y = 0; y < targetSize; y++) {
+        for (let x = 0; x < targetSize; x++) {
+          if (pixels[(y * targetSize + x) * 4 + 3] > 0) {
+            left = Math.min(left, x);
+            top = Math.min(top, y);
+            right = Math.max(right, x);
+            bottom = Math.max(bottom, y);
+          }
         }
       }
+      const cx = (left + right) / 2;
+      const cy = (top + bottom) / 2;
 
       const cleaned = await sharp(Buffer.from(pixels), {
         raw: { width: targetSize, height: targetSize, channels: 4 },
       }).png().toBuffer();
 
-      outputFrames.push(cleaned);
+      processed.push({ buffer: cleaned, cx, cy });
+    }
+
+    // Pass 2: compute median center and shift each frame to align
+    const medCx = median(processed.map(f => f.cx));
+    const medCy = median(processed.map(f => f.cy));
+
+    const pad = 64;
+    const padded = targetSize + pad * 2;
+
+    for (const { buffer, cx, cy } of processed) {
+      const shiftX = Math.round(medCx - cx);
+      const shiftY = Math.round(medCy - cy);
+
+      if (Math.abs(shiftX) < 2 && Math.abs(shiftY) < 2) {
+        outputFrames.push(buffer);
+        continue;
+      }
+
+      const shifted = await sharp({
+        create: { width: padded, height: padded, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+      })
+        .composite([{ input: buffer, left: pad + shiftX, top: pad + shiftY }])
+        .png().toBuffer();
+
+      const cropped = await sharp(shifted)
+        .extract({ left: pad, top: pad, width: targetSize, height: targetSize })
+        .png().toBuffer();
+
+      outputFrames.push(cropped);
     }
   }
 
-  onProgress?.("Frames ready", 4, totalSteps);
+  // Step 5: Quality gate
+  onProgress?.("Running quality checks", 5, totalSteps);
+  const quality = await runQualityChecks(outputFrames, params.frameCount, targetSize);
+
+  onProgress?.("Frames ready", 6, totalSteps);
 
   return {
     frames: outputFrames,
     rawSheet: sheetBuffer,
     frameWidth: targetSize,
     frameHeight: targetSize,
+    quality,
   };
 }
 
@@ -418,7 +1048,6 @@ export async function generateFrames(
       totalSteps
     );
 
-    // Edit from the base frame each time to prevent cumulative drift
     const sourceBuffer = baseFrameBuffer;
     const editSize = `${result.width}x${result.height}` as "1024x1024" | "1536x1024" | "1024x1536";
     const editedBuffer = await generator.editImage(
@@ -474,4 +1103,35 @@ export async function stitchFrames(
     .composite(composites)
     .png()
     .toBuffer();
+}
+
+/**
+ * Apply binary alpha cleanup to frame buffers for GIF output.
+ * GIF only supports on/off transparency, so all semi-transparent pixels
+ * must be snapped to fully transparent or fully opaque.
+ */
+export async function cleanFramesForGif(frameBuffers: Buffer[]): Promise<Buffer[]> {
+  const result: Buffer[] = [];
+
+  for (const buf of frameBuffers) {
+    const meta = await sharp(buf).metadata();
+    const w = meta.width || 256;
+    const h = meta.height || 256;
+
+    const raw = await sharp(buf)
+      .ensureAlpha()
+      .raw()
+      .toBuffer();
+
+    const pixels = new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength);
+    cleanAlpha(pixels, w, h, "binary");
+
+    const cleaned = await sharp(Buffer.from(pixels), {
+      raw: { width: w, height: h, channels: 4 },
+    }).png().toBuffer();
+
+    result.push(cleaned);
+  }
+
+  return result;
 }

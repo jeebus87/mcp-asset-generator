@@ -1,3 +1,6 @@
+import { fileURLToPath } from "url";
+import path from "path";
+import { config as dotenvConfig } from "dotenv";
 import OpenAI from "openai";
 import type { ImageGenerateParams } from "openai/resources/images.js";
 import { ServerConfig } from "./config.js";
@@ -11,6 +14,10 @@ import {
 import { enhancePrompt } from "./prompt.js";
 import { saveImage } from "./files.js";
 import { classifyApiError } from "./errors.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ENV_PATH = path.resolve(__dirname, "..", ".env");
 
 type ApiSize = NonNullable<ImageGenerateParams["size"]>;
 
@@ -37,12 +44,24 @@ function pickClosestSize(width: number, height: number): ApiSize {
 }
 
 export class ImageGenerator {
-  private openai: OpenAI;
   private config: ServerConfig;
 
   constructor(config: ServerConfig) {
     this.config = config;
-    this.openai = new OpenAI({ apiKey: config.openaiApiKey });
+  }
+
+  /** Re-read .env and return a live OpenAI client. Throws if no key is set. */
+  private getClient(): OpenAI {
+    dotenvConfig({ path: ENV_PATH, override: true });
+    const apiKey = process.env.OPENAI_API_KEY || this.config.openaiApiKey;
+    if (!apiKey) {
+      throw new Error(
+        "OPENAI_API_KEY is not set. " +
+          `Add it to ${ENV_PATH} or set it in your environment.`
+      );
+    }
+    this.config.openaiApiKey = apiKey;
+    return new OpenAI({ apiKey });
   }
 
   async generate(
@@ -85,7 +104,7 @@ export class ImageGenerator {
 
     let response;
     try {
-      response = await this.openai.images.generate(apiParams);
+      response = await this.getClient().images.generate(apiParams);
     } catch (error) {
       throw classifyApiError(error, params.prompt);
     }
@@ -163,7 +182,7 @@ export class ImageGenerator {
 
     let response;
     try {
-      response = await this.openai.images.edit(editParams as any);
+      response = await this.getClient().images.edit(editParams as any);
     } catch (error) {
       throw classifyApiError(error, prompt);
     }
@@ -180,7 +199,7 @@ export class ImageGenerator {
 
   async validateApiKey(): Promise<void> {
     try {
-      await this.openai.models.list();
+      await this.getClient().models.list();
     } catch (error: unknown) {
       if (error instanceof OpenAI.APIError) {
         if (error.status === 403) {
